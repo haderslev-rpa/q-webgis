@@ -1,5 +1,16 @@
 .venv/
 __pycache__/
+*.py[cod]
 .env
 .vscode/
-tests_local*/
+
+.pytest_cache/
+.ruff_cache/
+
+debug_playwright/
+tests_local_output/
+tests_local_playwright/
+runtime_output/
+
+kort_med_polygon_*.png
+kort_med_polygon_*.pdf
