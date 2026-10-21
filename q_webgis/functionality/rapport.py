@@ -917,17 +917,35 @@ async def aabn_rapport(
                     )
                 ).first
 
-            await _vent_paa_aktiv(
-                vis_rapport_knap,
-                navn="Vis rapport-knappen ved genforsøg",
-                timeout_ms=andet_forsoeg_ms,
+            overlay_arbejder = (
+                await loading.count() > 0
+                and await loading.is_visible()
             )
 
-            logger.info(
-                "Klikker Vis rapport igen."
-            )
+            if overlay_arbejder:
+                logger.warning(
+                    "WebGIS viser stadig 'Arbejder...'. "
+                    "Den oprindelige rapportbestilling kører "
+                    "derfor fortsat. Klikker ikke Vis rapport "
+                    "igen, men venter videre på download eller "
+                    "PDF-response."
+                )
 
-            await vis_rapport_knap.click()
+            else:
+                await _vent_paa_aktiv(
+                    vis_rapport_knap,
+                    navn="Vis rapport-knappen ved genforsøg",
+                    timeout_ms=andet_forsoeg_ms,
+                )
+
+                logger.info(
+                    "WebGIS arbejder ikke længere. "
+                    "Klikker Vis rapport igen."
+                )
+
+                await vis_rapport_knap.click(
+                    timeout=andet_forsoeg_ms,
+                )
 
             try:
                 resultat_type, resultat = (
