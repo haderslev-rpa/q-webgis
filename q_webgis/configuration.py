@@ -11,8 +11,19 @@ WEBGIS_URL = (
 )
 
 WEBGIS_CREDENTIAL_NAME = "DIRXOAS"
-
 WEBGIS_PROFILE = "maxi"
+
+
+# ------------------------------------------------------------
+# WebGIS API
+# ------------------------------------------------------------
+
+WEBGIS_STORED_DATA_URL = (
+    "https://webgis.intern.udcit.dk/"
+    "spatialmap?page=spatialanalyze-get-stored-data"
+)
+
+WEBGIS_STORED_DATA_PAGE = "spatialanalyze-get-stored-data"
 
 
 # ------------------------------------------------------------

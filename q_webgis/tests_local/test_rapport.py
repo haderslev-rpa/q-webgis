@@ -22,6 +22,9 @@ from q_webgis.functionality.rapport import (
     opret_webgis_rapport,
 )
 
+#
+#VIRKER KUN MED HEADLESS=TRUE
+#
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +112,7 @@ async def test_webgis_rapport() -> None:
     )
 
     session = BrowserSession(
-        headless=False,
+        headless=True,
         debug=True,
         http_credentials=http_credentials,
     )
