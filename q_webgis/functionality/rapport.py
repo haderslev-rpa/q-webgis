@@ -620,6 +620,10 @@ async def _vent_paa_konfliktsoegning_faerdig(
 # Rapport
 # ------------------------------------------------------------
 
+# ------------------------------------------------------------
+# START: aabn_rapport
+# ------------------------------------------------------------
+
 async def aabn_rapport(
     page: Page,
     *,
@@ -628,15 +632,38 @@ async def aabn_rapport(
     """
     Klikker Rapport og Vis rapport og venter på PDF-downloadet.
 
-    WebGIS åbner en midlertidig popupfane og starter derefter en
-    browser-download. I headless Chromium bliver popupfanen stående
-    på about:blank. Derfor bruges Playwrights download-event i stedet
-    for at vente på en PDF-URL i fanen.
+    En ny rapportfane er valgfri. Nogle WebGIS-rapporter åbner
+    en midlertidig popupfane, mens andre starter downloadet
+    direkte fra den eksisterende WebGIS-side.
+
+    Download-eventet er derfor det obligatoriske succeskriterium.
+    Funktionen venter ikke længere på context.expect_page().
 
     Output:
-        Returnerer rapportfanen. Det tilhørende Download-objekt
-        gemmes midlertidigt og anvendes af gem_rapport_pdf().
+        Returnerer den side, som downloadobjektet knyttes til.
+
+        Hvis WebGIS opretter en popupfane, returneres popupfanen.
+        Ellers returneres den oprindelige WebGIS-side.
+
+        Downloadobjektet gemmes midlertidigt i
+        _RAPPORT_DOWNLOADS og anvendes af gem_rapport_pdf().
     """
+    _valider_page(
+        page
+    )
+
+    if (
+        isinstance(timeout_ms, bool)
+        or not isinstance(timeout_ms, int)
+    ):
+        raise TypeError(
+            "timeout_ms skal være et heltal."
+        )
+
+    if timeout_ms <= 0:
+        raise ValueError(
+            "timeout_ms skal være større end 0."
+        )
 
     rapport_knap = page.locator(
         RAPPORT_KNAP
@@ -688,11 +715,21 @@ async def aabn_rapport(
         event_loop.create_future()
     )
 
-    rapport_side: Page | None = None
+    nye_sider: list[Page] = []
+
+    sider_med_download_listener: list[Page] = [
+        page
+    ]
 
     def ved_download(
         download: Download,
     ) -> None:
+        """
+        Registrerer det første download-event.
+
+        Senere download-events ignoreres, så én rapportbestilling
+        aldrig kan overskrive det oprindelige downloadobjekt.
+        """
         if not download_future.done():
             download_future.set_result(
                 download
@@ -701,9 +738,29 @@ async def aabn_rapport(
     def ved_ny_side(
         ny_side: Page,
     ) -> None:
+        """
+        Registrerer en eventuel popupfane.
+
+        Popupfanen er valgfri, men dens download-events lyttes til,
+        hvis WebGIS vælger at starte downloadet derfra.
+        """
+        nye_sider.append(
+            ny_side
+        )
+
         ny_side.on(
             "download",
             ved_download,
+        )
+
+        sider_med_download_listener.append(
+            ny_side
+        )
+
+        logger.debug(
+            "WebGIS oprettede en rapportfane. "
+            "Aktuel URL: %s",
+            ny_side.url,
         )
 
     page.on(
@@ -717,28 +774,44 @@ async def aabn_rapport(
     )
 
     logger.info(
-        "Bestiller rapporten og venter på download-event."
+        "Bestiller rapporten og venter på download-event. "
+        "En ny rapportfane er valgfri."
     )
 
     try:
-        async with page.context.expect_page(
-            timeout=timeout_ms,
-        ) as ny_side_info:
-            await vis_rapport_knap.click()
+        # Der klikkes præcis én gang.
+        #
+        # Koden anvender bevidst ikke context.expect_page(),
+        # fordi nogle WebGIS-rapporter starter downloadet uden
+        # at udløse et stabilt page-event.
+        await vis_rapport_knap.click()
 
-        rapport_side = await ny_side_info.value
+        try:
+            download = await asyncio.wait_for(
+                asyncio.shield(
+                    download_future
+                ),
+                timeout=timeout_ms / 1_000,
+            )
 
-        rapport_side.on(
-            "download",
-            ved_download,
-        )
+        except TimeoutError as error:
+            popup_information = [
+                {
+                    "url": str(
+                        popup.url or ""
+                    ),
+                    "lukket": popup.is_closed(),
+                }
+                for popup in nye_sider
+            ]
 
-        download = await asyncio.wait_for(
-            asyncio.shield(
-                download_future
-            ),
-            timeout=timeout_ms / 1_000,
-        )
+            raise RuntimeError(
+                "WebGIS startede ikke PDF-downloadet inden for "
+                f"{timeout_ms} ms. "
+                "En ny rapportfane er ikke påkrævet. "
+                f"Registrerede rapportfaner: "
+                f"{popup_information}."
+            ) from error
 
         download_fejl = await download.failure()
 
@@ -748,14 +821,27 @@ async def aabn_rapport(
                 f"{download_fejl}"
             )
 
+        # Hvis en popupfane blev oprettet, anvendes den seneste
+        # åbne popup som rapportside. Ellers bruges hovedsiden.
+        rapport_side = page
+
+        for mulig_rapport_side in reversed(
+            nye_sider
+        ):
+            if not mulig_rapport_side.is_closed():
+                rapport_side = mulig_rapport_side
+                break
+
         _RAPPORT_DOWNLOADS[
             id(rapport_side)
         ] = download
 
         logger.info(
             "Download-event modtaget. "
-            "Foreslået filnavn: %s",
+            "Foreslået filnavn: %s. "
+            "Rapportfane oprettet: %s.",
             download.suggested_filename,
+            rapport_side is not page,
         )
 
         if await loading.count() > 0:
@@ -764,36 +850,41 @@ async def aabn_rapport(
                     state="hidden",
                     timeout=timeout_ms,
                 )
+
             except PlaywrightTimeoutError:
                 logger.debug(
-                    "Rapport-loading kunne ikke længere findes "
-                    "på den oprindelige side."
+                    "Rapport-loading forsvandt ikke inden "
+                    "for timeouten, men PDF-downloadet er "
+                    "allerede modtaget."
                 )
 
         return rapport_side
 
-    except TimeoutError as exc:
-        raise RuntimeError(
-            "WebGIS åbnede rapportfanen, men startede ikke "
-            "downloadet inden for timeouten."
-        ) from exc
-
     finally:
-        page.remove_listener(
-            "download",
-            ved_download,
-        )
-
         page.context.remove_listener(
             "page",
             ved_ny_side,
         )
 
-        if rapport_side is not None:
-            rapport_side.remove_listener(
-                "download",
-                ved_download,
-            )
+        for side_med_listener in (
+            sider_med_download_listener
+        ):
+            try:
+                side_med_listener.remove_listener(
+                    "download",
+                    ved_download,
+                )
+            except Exception:
+                logger.debug(
+                    "Download-listeneren kunne ikke fjernes "
+                    "fra en WebGIS-side.",
+                    exc_info=True,
+                )
+
+
+# ------------------------------------------------------------
+# SLUT: aabn_rapport
+# ------------------------------------------------------------
 
 # ------------------------------------------------------------
 # START: gem_rapport_pdf
