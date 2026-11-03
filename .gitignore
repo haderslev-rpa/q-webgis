@@ -6,7 +6,7 @@ __pycache__/
 
 .pytest_cache/
 .ruff_cache/
-
+tests_local/
 debug_playwright/
 tests_local_output/
 tests_local_playwright/

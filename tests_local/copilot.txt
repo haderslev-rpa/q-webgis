@@ -41,8 +41,31 @@ WEBGIS_URL = (
 )
 
 WEBGIS_CREDENTIAL_NAME = "DIRXOAS"
-
 WEBGIS_PROFILE = "maxi"
+
+
+# ------------------------------------------------------------
+# WebGIS API
+# ------------------------------------------------------------
+
+WEBGIS_STORED_DATA_URL = (
+    "https://webgis.intern.udcit.dk/"
+    "spatialmap?page=spatialanalyze-get-stored-data"
+)
+
+WEBGIS_STORED_DATA_PAGE = (
+    "spatialanalyze-get-stored-data"
+)
+
+
+# ------------------------------------------------------------
+# Bådpladsredigering
+# ------------------------------------------------------------
+
+WEBGIS_BAADPLADS_UPDATE_URL = (
+    "https://webgis.intern.udcit.dk/"
+    "sfs/rest/features/ds-baadplads/sps"
+)
 
 
 # ------------------------------------------------------------
@@ -106,15 +129,1011 @@ WEBGIS_RAPPORT_FILNAVN = (
 )
 ===== ./q_webgis/functionality/__init__.py =====
 
+===== ./q_webgis/functionality/baadplads_status.py =====
+from __future__ import annotations
+
+import copy
+import json
+import logging
+from typing import Any
+
+from playwright.async_api import Page
+
+from q_webgis.configuration import (
+    WEBGIS_BAADPLADS_UPDATE_URL,
+    WEBGIS_TIMEOUT_MS,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------
+# Verificerede driftstatuskoder
+# ------------------------------------------------------------
+
+DRIFTSTATUS_FRI = "1"
+DRIFTSTATUS_UDLEJET = "3"
+
+KENDTE_DRIFTSTATUS_LABELS = {
+    DRIFTSTATUS_FRI: "Fri",
+    DRIFTSTATUS_UDLEJET: "Udlejet",
+}
+
+
+# ------------------------------------------------------------
+# START: aendr_baadplads_status
+# ------------------------------------------------------------
+
+async def aendr_baadplads_status(
+    page: Page,
+    ticket: str,
+    baadplads: dict[str, Any],
+    ny_driftstatus: int | str,
+    *,
+    timeout_ms: int = WEBGIS_TIMEOUT_MS,
+) -> dict[str, Any]:
+    """
+    Ændrer driftstatus på én angivet bådplads.
+
+    Funktionen opdaterer kun den bådplads, der sendes ind i
+    parameteren baadplads. Havn, strækning, plads og ogc_fid
+    læses fra inputobjektet og er ikke hardkodet.
+
+    Funktionen accepterer både:
+
+        1. Et komplet SFS-featureobjekt med attributes.
+
+        2. En flad bådpladsrække, hvis rækken indeholder wkt,
+           projection, hasattachments, ogc_fid og driftstatus.
+
+    Parametre:
+        page:
+            Den åbne og autentificerede WebGIS-side.
+
+        ticket:
+            Ticket-headeren opsnappet fra WebGIS' egne requests.
+
+        baadplads:
+            Den bådplads, der skal ændres.
+
+        ny_driftstatus:
+            Den ønskede tekniske statuskode.
+
+            Verificerede værdier:
+
+                1 = Fri
+                3 = Udlejet
+
+        timeout_ms:
+            Maksimal ventetid for PUT-requestet.
+
+    Output:
+        Dictionary med identifikation, tidligere status, ny status,
+        HTTP-status og WebGIS-svar.
+
+    Sikkerhed:
+        Ticket, cookies og credentials bliver ikke logget.
+    """
+    _valider_page(
+        page
+    )
+
+    valideret_ticket = _valider_tekst(
+        value=ticket,
+        field_name="ticket",
+    )
+
+    valideret_timeout_ms = _valider_positivt_heltal(
+        value=timeout_ms,
+        field_name="timeout_ms",
+    )
+
+    valideret_driftstatus = _valider_driftstatus(
+        ny_driftstatus
+    )
+
+    original_feature = _normaliser_baadplads_feature(
+        baadplads
+    )
+
+    feature_til_opdatering = copy.deepcopy(
+        original_feature
+    )
+
+    feature_til_opdatering[
+        "attributes"
+    ][
+        "driftstatus"
+    ] = valideret_driftstatus
+
+    oprindelige_attributes = original_feature[
+        "attributes"
+    ]
+
+    attributes = feature_til_opdatering[
+        "attributes"
+    ]
+
+    ogc_fid = attributes[
+        "ogc_fid"
+    ]
+
+    tidligere_driftstatus = str(
+        oprindelige_attributes.get(
+            "driftstatus",
+            "",
+        )
+    ).strip()
+
+    havn = _hent_valgfri_attribut(
+        attributes=attributes,
+        field_name="havn",
+    )
+
+    straekning = _hent_valgfri_attribut(
+        attributes=attributes,
+        field_name="straekning",
+    )
+
+    plads = _hent_valgfri_attribut(
+        attributes=attributes,
+        field_name="plads",
+    )
+
+    status_label = KENDTE_DRIFTSTATUS_LABELS[
+        valideret_driftstatus
+    ]
+
+    if tidligere_driftstatus == valideret_driftstatus:
+        logger.info(
+            "Bådpladsen har allerede den ønskede status. "
+            "ogc_fid=%s, havn=%r, plads=%r, status=%s (%s).",
+            ogc_fid,
+            havn,
+            plads,
+            valideret_driftstatus,
+            status_label,
+        )
+
+        return {
+            "success": True,
+            "opdateret": False,
+            "oversprunget": True,
+            "aarsag": (
+                "Bådpladsen har allerede den ønskede status."
+            ),
+            "ogc_fid": ogc_fid,
+            "havn": havn,
+            "straekning": straekning,
+            "plads": plads,
+            "tidligere_driftstatus": tidligere_driftstatus,
+            "ny_driftstatus": valideret_driftstatus,
+            "status_label": status_label,
+            "http_status": None,
+            "response_data": None,
+        }
+
+    logger.info(
+        "Ændrer bådpladsstatus. ogc_fid=%s, havn=%r, "
+        "strækning=%r, plads=%r, fra=%r, til=%r (%s).",
+        ogc_fid,
+        havn,
+        straekning,
+        plads,
+        tidligere_driftstatus,
+        valideret_driftstatus,
+        status_label,
+    )
+
+    request_payload = {
+        "features": [
+            feature_til_opdatering
+        ]
+    }
+
+    browser_resultat = await page.evaluate(
+        """
+        async ({
+            url,
+            ticket,
+            requestPayload,
+            timeoutMs
+        }) => {
+            const controller = new AbortController();
+
+            const timeoutHandle = setTimeout(
+                () => controller.abort(),
+                timeoutMs
+            );
+
+            try {
+                const response = await fetch(
+                    url,
+                    {
+                        method: "PUT",
+                        credentials: "include",
+                        headers: {
+                            "Accept": (
+                                "application/json, "
+                                + "text/javascript, "
+                                + "*/*; q=0.01"
+                            ),
+                            "Content-Type": (
+                                "application/json; "
+                                + "charset=UTF-8"
+                            ),
+                            "Ticket": ticket,
+                            "X-Requested-With": (
+                                "XMLHttpRequest"
+                            )
+                        },
+                        body: JSON.stringify(
+                            requestPayload
+                        ),
+                        signal: controller.signal
+                    }
+                );
+
+                const responseText = (
+                    await response.text()
+                );
+
+                return {
+                    ok: response.ok,
+                    status: response.status,
+                    statusText: response.statusText,
+                    contentType: (
+                        response.headers.get(
+                            "content-type"
+                        )
+                        || ""
+                    ),
+                    responseText: responseText,
+                    finalUrl: response.url,
+                    browserError: ""
+                };
+            } catch (error) {
+                return {
+                    ok: false,
+                    status: 0,
+                    statusText: "",
+                    contentType: "",
+                    responseText: "",
+                    finalUrl: "",
+                    browserError: (
+                        error instanceof Error
+                            ? (
+                                error.name
+                                + ": "
+                                + error.message
+                            )
+                            : String(error)
+                    )
+                };
+            } finally {
+                clearTimeout(
+                    timeoutHandle
+                );
+            }
+        }
+        """,
+        {
+            "url": WEBGIS_BAADPLADS_UPDATE_URL,
+            "ticket": valideret_ticket,
+            "requestPayload": request_payload,
+            "timeoutMs": valideret_timeout_ms,
+        },
+    )
+
+    fetch_resultat = _valider_fetch_resultat(
+        browser_resultat
+    )
+
+    browser_error = str(
+        fetch_resultat.get("browserError")
+        or ""
+    ).strip()
+
+    if browser_error:
+        raise RuntimeError(
+            "WebGIS-kaldet til ændring af bådpladsstatus "
+            "kunne ikke udføres. "
+            f"ogc_fid={ogc_fid}. "
+            f"Browserfejl: {browser_error}"
+        )
+
+    status = fetch_resultat[
+        "status"
+    ]
+
+    status_text = str(
+        fetch_resultat.get("statusText")
+        or ""
+    ).strip()
+
+    content_type = str(
+        fetch_resultat.get("contentType")
+        or ""
+    ).strip()
+
+    response_text = str(
+        fetch_resultat.get("responseText")
+        or ""
+    ).strip()
+
+    final_url = str(
+        fetch_resultat.get("finalUrl")
+        or ""
+    ).strip()
+
+    if not fetch_resultat[
+        "ok"
+    ]:
+        raise RuntimeError(
+            "WebGIS afviste ændringen af bådpladsstatus. "
+            f"ogc_fid={ogc_fid}. "
+            f"HTTP-status={status}. "
+            f"Statusbesked={status_text!r}. "
+            f"Content-Type={content_type!r}. "
+            f"Slut-URL={final_url!r}. "
+            "Svareksempel: "
+            f"{_lav_sikkert_response_preview(response_text)}"
+        )
+
+    response_data = _parse_response(
+        response_text=response_text,
+        content_type=content_type,
+    )
+
+    logger.info(
+        "Bådpladsstatus er ændret. ogc_fid=%s, "
+        "havn=%r, plads=%r, ny status=%s (%s).",
+        ogc_fid,
+        havn,
+        plads,
+        valideret_driftstatus,
+        status_label,
+    )
+
+    return {
+        "success": True,
+        "opdateret": True,
+        "oversprunget": False,
+        "aarsag": None,
+        "ogc_fid": ogc_fid,
+        "havn": havn,
+        "straekning": straekning,
+        "plads": plads,
+        "tidligere_driftstatus": tidligere_driftstatus,
+        "ny_driftstatus": valideret_driftstatus,
+        "status_label": status_label,
+        "http_status": status,
+        "response_data": response_data,
+    }
+
+
+# ------------------------------------------------------------
+# SLUT: aendr_baadplads_status
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# Feature-normalisering
+# ------------------------------------------------------------
+
+def _normaliser_baadplads_feature(
+    baadplads: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Normaliserer input til det komplette SFS-featureformat.
+
+    Et allerede komplet featureobjekt kopieres uændret.
+    En flad række pakkes ind i attributes.
+    """
+    if not isinstance(
+        baadplads,
+        dict,
+    ):
+        raise TypeError(
+            "baadplads skal være en dictionary."
+        )
+
+    if isinstance(
+        baadplads.get("attributes"),
+        dict,
+    ):
+        feature = copy.deepcopy(
+            baadplads
+        )
+    else:
+        envelope_fields = {
+            "wkt",
+            "projection",
+            "hasattachments",
+        }
+
+        attributes = {
+            key: copy.deepcopy(value)
+            for key, value in baadplads.items()
+            if key not in envelope_fields
+        }
+
+        feature = {
+            "wkt": baadplads.get("wkt"),
+            "projection": (
+                baadplads.get("projection")
+                or "EPSG:25832"
+            ),
+            "hasattachments": baadplads.get(
+                "hasattachments",
+                False,
+            ),
+            "attributes": attributes,
+        }
+
+    _valider_baadplads_feature(
+        feature
+    )
+
+    return feature
+
+
+def _valider_baadplads_feature(
+    feature: dict[str, Any],
+) -> None:
+    """Validerer felterne, som det verificerede PUT kræver."""
+    wkt = feature.get(
+        "wkt"
+    )
+
+    if (
+        not isinstance(wkt, str)
+        or not wkt.strip()
+    ):
+        raise ValueError(
+            "Bådpladsen mangler wkt. Der skal bruges "
+            "det komplette featureobjekt fra WebGIS."
+        )
+
+    projection = feature.get(
+        "projection"
+    )
+
+    if (
+        not isinstance(projection, str)
+        or not projection.strip()
+    ):
+        raise ValueError(
+            "Bådpladsen mangler projection."
+        )
+
+    if not isinstance(
+        feature.get("hasattachments"),
+        bool,
+    ):
+        raise TypeError(
+            "hasattachments skal være boolsk."
+        )
+
+    attributes = feature.get(
+        "attributes"
+    )
+
+    if not isinstance(
+        attributes,
+        dict,
+    ):
+        raise TypeError(
+            "Bådpladsen mangler attributes."
+        )
+
+    if attributes.get("ogc_fid") is None:
+        raise ValueError(
+            "Bådpladsen mangler ogc_fid."
+        )
+
+    if "driftstatus" not in attributes:
+        raise ValueError(
+            "Bådpladsen mangler driftstatus."
+        )
+
+
+def _hent_valgfri_attribut(
+    *,
+    attributes: dict[str, Any],
+    field_name: str,
+) -> str | None:
+    """Returnerer en valgfri attribut som trimmet tekst."""
+    value = attributes.get(
+        field_name
+    )
+
+    if value is None:
+        return None
+
+    text = str(
+        value
+    ).strip()
+
+    return text or None
+
+
+# ------------------------------------------------------------
+# Validering
+# ------------------------------------------------------------
+
+def _valider_driftstatus(
+    value: Any,
+) -> str:
+    """Validerer de statuskoder, der er verificeret i WebGIS."""
+    if isinstance(
+        value,
+        bool,
+    ):
+        raise TypeError(
+            "ny_driftstatus må ikke være boolsk."
+        )
+
+    if not isinstance(
+        value,
+        (
+            int,
+            str,
+        ),
+    ):
+        raise TypeError(
+            "ny_driftstatus skal være et heltal "
+            "eller tekst."
+        )
+
+    driftstatus = str(
+        value
+    ).strip()
+
+    if driftstatus not in KENDTE_DRIFTSTATUS_LABELS:
+        raise ValueError(
+            "Kun statuskode 1 (Fri) og 3 (Udlejet) "
+            "er verificeret."
+        )
+
+    return driftstatus
+
+
+def _valider_fetch_resultat(
+    value: Any,
+) -> dict[str, Any]:
+    """Validerer resultatet fra browserens fetch-kald."""
+    if not isinstance(
+        value,
+        dict,
+    ):
+        raise RuntimeError(
+            "WebGIS-statuskaldet returnerede et "
+            "ugyldigt browserresultat."
+        )
+
+    status = value.get(
+        "status"
+    )
+
+    if (
+        isinstance(status, bool)
+        or not isinstance(status, int)
+    ):
+        raise RuntimeError(
+            "WebGIS-statuskaldet returnerede en "
+            "ugyldig HTTP-status."
+        )
+
+    if not isinstance(
+        value.get("ok"),
+        bool,
+    ):
+        raise RuntimeError(
+            "WebGIS-statuskaldet returnerede ikke "
+            "en gyldig ok-status."
+        )
+
+    return value
+
+
+def _valider_page(
+    page: Page,
+) -> None:
+    """Kontrollerer, at Playwright-siden kan anvendes."""
+    if page is None:
+        raise ValueError(
+            "page skal angives."
+        )
+
+    if page.is_closed():
+        raise RuntimeError(
+            "WebGIS-siden er lukket og kan ikke "
+            "bruges til at ændre bådpladsstatus."
+        )
+
+
+def _valider_tekst(
+    *,
+    value: Any,
+    field_name: str,
+) -> str:
+    """Returnerer en obligatorisk, trimmet tekstværdi."""
+    if not isinstance(
+        value,
+        str,
+    ):
+        raise TypeError(
+            f"{field_name} skal være tekst."
+        )
+
+    cleaned_value = value.strip()
+
+    if not cleaned_value:
+        raise ValueError(
+            f"{field_name} må ikke være tom."
+        )
+
+    return cleaned_value
+
+
+def _valider_positivt_heltal(
+    *,
+    value: Any,
+    field_name: str,
+) -> int:
+    """Returnerer værdien som et positivt heltal."""
+    if isinstance(
+        value,
+        bool,
+    ):
+        raise TypeError(
+            f"{field_name} må ikke være boolsk."
+        )
+
+    try:
+        integer_value = int(
+            value
+        )
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise TypeError(
+            f"{field_name} skal være et heltal."
+        ) from exc
+
+    if integer_value <= 0:
+        raise ValueError(
+            f"{field_name} skal være større end 0."
+        )
+
+    return integer_value
+
+
+# ------------------------------------------------------------
+# Response
+# ------------------------------------------------------------
+
+def _parse_response(
+    *,
+    response_text: str,
+    content_type: str,
+) -> Any:
+    """Parser WebGIS-svaret som JSON, tekst eller None."""
+    if not response_text:
+        return None
+
+    ligner_json = (
+        "json" in content_type.casefold()
+        or response_text.lstrip().startswith("{")
+        or response_text.lstrip().startswith("[")
+    )
+
+    if not ligner_json:
+        return response_text
+
+    try:
+        return json.loads(
+            response_text
+        )
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "WebGIS returnerede et svar, der ligner "
+            "JSON, men ikke kunne parses. "
+            f"JSON-fejl: {exc.msg}."
+        ) from exc
+
+
+def _lav_sikkert_response_preview(
+    value: Any,
+    maximum_length: int = 500,
+) -> str:
+    """Laver et begrænset preview af WebGIS-svaret."""
+    text = " ".join(
+        str(
+            value
+            or ""
+        ).split()
+    )
+
+    if not text:
+        return "<tomt svar>"
+
+    if len(text) <= maximum_length:
+        return text
+
+    return (
+        text[:maximum_length]
+        + "..."
+    )
+
+
+__all__ = [
+    "DRIFTSTATUS_FRI",
+    "DRIFTSTATUS_UDLEJET",
+    "aendr_baadplads_status",
+]
+
+===== ./q_webgis/functionality/baadpladser.py =====
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from playwright.async_api import Page
+
+from q_webgis.configuration import (
+    WEBGIS_MAXROWS,
+    WEBGIS_TIMEOUT_MS,
+)
+from q_webgis.functionality.spatialanalyze import (
+    hent_spatialanalyze_raekker,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------
+# Bådpladsindstillinger
+# ------------------------------------------------------------
+
+BAADPLADS_MAXROWS = WEBGIS_MAXROWS
+BAADPLADS_JSONTYPES = "true"
+BAADPLADS_OUTPUTFORMAT = "json"
+BAADPLADS_ERROR_CONTENT_TYPE = "json"
+
+
+# ------------------------------------------------------------
+# START: hent_baadpladser
+# ------------------------------------------------------------
+
+async def hent_baadpladser(
+    page: Page,
+    session_id: str,
+    *,
+    maxrows: int = BAADPLADS_MAXROWS,
+    timeout_ms: int = WEBGIS_TIMEOUT_MS,
+) -> list[dict[str, Any]]:
+    """
+    Henter alle bådpladser fra den seneste spatialanalyse i den
+    aktuelle WebGIS-session.
+
+    Funktionen starter ikke selv spatialanalysen. Analysen for
+    ds-baadplads skal være gennemført først med samme Page,
+    JSESSIONID og Session-Id.
+
+    Parametre:
+        page:
+            Den åbne og autentificerede WebGIS-side.
+
+        session_id:
+            Session-Id opsnappet fra WebGIS' egne requests.
+
+        maxrows:
+            Maksimalt antal rækker, WebGIS må returnere.
+
+        timeout_ms:
+            Maksimal ventetid for requestet i millisekunder.
+
+    Output:
+        En liste med alle returnerede bådpladsrækker.
+
+        Hver række returneres uændret fra den eksisterende
+        hent_spatialanalyze_raekker()-funktion.
+
+    Fejl:
+        RuntimeError hvis WebGIS-siden er lukket, eller hvis
+        resultatet rammer maxrows og derfor kan være afkortet.
+    """
+    _valider_page(
+        page
+    )
+
+    valideret_session_id = _valider_tekst(
+        value=session_id,
+        field_name="session_id",
+    )
+
+    valideret_maxrows = _valider_positivt_heltal(
+        value=maxrows,
+        field_name="maxrows",
+    )
+
+    valideret_timeout_ms = _valider_positivt_heltal(
+        value=timeout_ms,
+        field_name="timeout_ms",
+    )
+
+    logger.info(
+        "Henter op til %s bådpladser fra den seneste "
+        "WebGIS-spatialanalyse.",
+        valideret_maxrows,
+    )
+
+    baadpladser = await hent_spatialanalyze_raekker(
+        page=page,
+        session_id=valideret_session_id,
+        maxrows=valideret_maxrows,
+        jsontypes=BAADPLADS_JSONTYPES,
+        outputformat=BAADPLADS_OUTPUTFORMAT,
+        error_content_type=(
+            BAADPLADS_ERROR_CONTENT_TYPE
+        ),
+        timeout_ms=valideret_timeout_ms,
+    )
+
+    _valider_baadpladsraekker(
+        baadpladser
+    )
+
+    if len(baadpladser) >= valideret_maxrows:
+        raise RuntimeError(
+            "WebGIS returnerede det maksimalt tilladte "
+            "antal bådpladser. Resultatet kan derfor være "
+            "afkortet. "
+            f"Antal rækker: {len(baadpladser)}. "
+            f"Maxrows: {valideret_maxrows}."
+        )
+
+    logger.info(
+        "WebGIS returnerede %s bådpladser.",
+        len(baadpladser),
+    )
+
+    return baadpladser
+
+
+# ------------------------------------------------------------
+# SLUT: hent_baadpladser
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# Validering
+# ------------------------------------------------------------
+
+def _valider_baadpladsraekker(
+    baadpladser: Any,
+) -> None:
+    """Kontrollerer, at resultatet er en liste af dictionaries."""
+    if not isinstance(
+        baadpladser,
+        list,
+    ):
+        raise TypeError(
+            "hent_spatialanalyze_raekker() skal "
+            "returnere en liste."
+        )
+
+    for index, baadplads in enumerate(
+        baadpladser,
+        start=1,
+    ):
+        if not isinstance(
+            baadplads,
+            dict,
+        ):
+            raise TypeError(
+                "Alle bådpladsrækker skal være "
+                "dictionaries. "
+                f"Række {index} har typen "
+                f"{type(baadplads).__name__}."
+            )
+
+
+def _valider_page(
+    page: Page,
+) -> None:
+    """Kontrollerer, at Playwright-siden kan anvendes."""
+    if page is None:
+        raise ValueError(
+            "page skal angives."
+        )
+
+    if page.is_closed():
+        raise RuntimeError(
+            "WebGIS-siden er lukket og kan ikke "
+            "bruges til at hente bådpladser."
+        )
+
+
+def _valider_tekst(
+    *,
+    value: Any,
+    field_name: str,
+) -> str:
+    """Returnerer en obligatorisk, trimmet tekstværdi."""
+    if not isinstance(
+        value,
+        str,
+    ):
+        raise TypeError(
+            f"{field_name} skal være tekst."
+        )
+
+    cleaned_value = value.strip()
+
+    if not cleaned_value:
+        raise ValueError(
+            f"{field_name} må ikke være tom."
+        )
+
+    return cleaned_value
+
+
+def _valider_positivt_heltal(
+    *,
+    value: Any,
+    field_name: str,
+) -> int:
+    """Returnerer værdien som et positivt heltal."""
+    if isinstance(
+        value,
+        bool,
+    ):
+        raise TypeError(
+            f"{field_name} må ikke være boolsk."
+        )
+
+    try:
+        integer_value = int(
+            value
+        )
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise TypeError(
+            f"{field_name} skal være et heltal."
+        ) from exc
+
+    if integer_value <= 0:
+        raise ValueError(
+            f"{field_name} skal være større end 0."
+        )
+
+    return integer_value
+
+
+__all__ = [
+    "BAADPLADS_MAXROWS",
+    "hent_baadpladser",
+]
+
 ===== ./q_webgis/functionality/rapport.py =====
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.async_api import (
+    Download,
     Locator,
     Page,
     TimeoutError as PlaywrightTimeoutError,
@@ -154,6 +1173,16 @@ from q_webgis.selectors import (
 logger = logging.getLogger(__name__)
 
 
+# Downloadobjektet knyttes midlertidigt til rapportfanen.
+# Det fjernes igen, så en senere rapport aldrig kan genbruge downloadet.
+_RAPPORT_DOWNLOADS: dict[int, Download] = {}
+_RAPPORT_PDF_BYTES: dict[int, bytes] = {}
+
+
+#
+#VIRKER KUN MED HEADLESS=TRUE
+#
+
 # ------------------------------------------------------------
 # Offentlig hovedfunktion
 # ------------------------------------------------------------
@@ -188,7 +1217,7 @@ async def opret_webgis_rapport(
         5. Venter på status "Færdig".
         6. Åbner rapportdialogen.
         7. Klikker "Vis rapport".
-        8. Henter PDF'en gennem den autentificerede WebGIS-side.
+        8. Gemmer PDF'en direkte fra browserens download-event.
         9. Tager screenshots efter hvert hovedtrin.
 
     Output:
@@ -326,6 +1355,17 @@ async def opret_webgis_rapport(
         raise
 
     finally:
+        if rapport_side is not None:
+            _RAPPORT_DOWNLOADS.pop(
+                id(rapport_side),
+                None,
+            )
+
+            _RAPPORT_PDF_BYTES.pop(
+                id(rapport_side),
+                None,
+            )
+
         if (
             rapport_side is not None
             and rapport_side != page
@@ -712,19 +1752,47 @@ async def _vent_paa_konfliktsoegning_faerdig(
 # Rapport
 # ------------------------------------------------------------
 
+# ------------------------------------------------------------
+# START: aabn_rapport
+# ------------------------------------------------------------
+
 async def aabn_rapport(
     page: Page,
     *,
     timeout_ms: int = WEBGIS_RAPPORT_TIMEOUT_MS,
 ) -> Page:
     """
-    Klikker Rapport og Vis rapport.
+    Bestiller WebGIS-rapporten og venter på et PDF-resultat.
+
+    Funktionen bevarer det eksisterende download-flow og tilføjer
+    to målrettede sikkerhedsnet:
+
+    1. Et PDF-response accepteres, hvis Chromium ikke udløser et
+       normalt download-event.
+    2. Rapportbestillingen forsøges én ekstra gang, hvis første klik
+       ikke giver et download eller PDF-response.
+
+    Den samlede ventetid overstiger ikke timeout_ms.
 
     Output:
-        Returnerer den nye Page, som viser PDF-rapporten.
-        Hvis WebGIS mod forventning genbruger samme fane, returneres
-        den eksisterende Page.
+        Returnerer den side, som rapportresultatet knyttes til.
+        Resultatet gemmes midlertidigt i _RAPPORT_DOWNLOADS eller
+        _RAPPORT_PDF_BYTES og anvendes af gem_rapport_pdf().
     """
+    _valider_page(page)
+
+    if (
+        isinstance(timeout_ms, bool)
+        or not isinstance(timeout_ms, int)
+    ):
+        raise TypeError(
+            "timeout_ms skal være et heltal."
+        )
+
+    if timeout_ms <= 0:
+        raise ValueError(
+            "timeout_ms skal være større end 0."
+        )
 
     rapport_knap = page.locator(
         RAPPORT_KNAP
@@ -770,58 +1838,389 @@ async def aabn_rapport(
         RAPPORT_LOADING
     ).first
 
-    sider_foer = set(
-        page.context.pages
+    event_loop = asyncio.get_running_loop()
+
+    download_future: asyncio.Future[Download] = (
+        event_loop.create_future()
     )
 
-    logger.info(
-        "Bestiller den færdige PDF-rapport."
+    pdf_response_future: asyncio.Future[bytes] = (
+        event_loop.create_future()
     )
 
-    async with page.context.expect_page(
-        timeout=timeout_ms,
-    ) as ny_side_info:
+    nye_sider: list[Page] = []
+    sider_med_download_listener: list[Page] = [page]
+    response_tasks: set[asyncio.Task[None]] = set()
+    netvaerksfejl: list[str] = []
+    mulige_pdf_svar: list[str] = []
+
+    def ved_download(
+        download: Download,
+    ) -> None:
+        if not download_future.done():
+            download_future.set_result(download)
+
+    async def behandl_response(response) -> None:
+        try:
+            headers = await response.all_headers()
+            content_type = str(
+                headers.get("content-type", "")
+            ).casefold()
+            content_disposition = str(
+                headers.get("content-disposition", "")
+            ).casefold()
+            response_url = str(response.url or "")
+
+            er_pdf_response = (
+                "application/pdf" in content_type
+                or (
+                    "filename=" in content_disposition
+                    and ".pdf" in content_disposition
+                )
+                or re.search(
+                    r"\.pdf(?:$|[?#])",
+                    response_url,
+                    re.IGNORECASE,
+                ) is not None
+            )
+
+            if not er_pdf_response:
+                return
+
+            mulige_pdf_svar.append(
+                _sikker_url(response_url)
+            )
+
+            pdf_bytes = await response.body()
+
+            if not pdf_bytes.startswith(b"%PDF-"):
+                logger.warning(
+                    "WebGIS returnerede et muligt PDF-response "
+                    "uden gyldig PDF-signatur. URL=%s, "
+                    "Content-Type=%s.",
+                    _sikker_url(response_url),
+                    content_type,
+                )
+                return
+
+            if not pdf_response_future.done():
+                pdf_response_future.set_result(pdf_bytes)
+
+        except Exception:
+            logger.debug(
+                "Et WebGIS-response kunne ikke undersøges.",
+                exc_info=True,
+            )
+
+    def ved_response(response) -> None:
+        task = event_loop.create_task(
+            behandl_response(response)
+        )
+        response_tasks.add(task)
+        task.add_done_callback(
+            response_tasks.discard
+        )
+
+    def ved_request_failed(request) -> None:
+        try:
+            netvaerksfejl.append(
+                f"{request.method} "
+                f"{_sikker_url(request.url)} "
+                f"failure={request.failure!r}"
+            )
+        except Exception:
+            netvaerksfejl.append(
+                "Et WebGIS-request fejlede uden læsbare detaljer."
+            )
+
+    def ved_ny_side(ny_side: Page) -> None:
+        nye_sider.append(ny_side)
+        ny_side.on("download", ved_download)
+        sider_med_download_listener.append(ny_side)
+
+        logger.info(
+            "WebGIS oprettede en rapportfane. "
+            "Aktuel URL: %s",
+            _sikker_url(ny_side.url),
+        )
+
+    page.on("download", ved_download)
+    page.context.on("page", ved_ny_side)
+    page.context.on("response", ved_response)
+    page.context.on("requestfailed", ved_request_failed)
+
+    async def vent_paa_rapportresultat(
+        ventetid_ms: int,
+    ) -> tuple[str, Download | bytes]:
+        faerdige, _ = await asyncio.wait(
+            {
+                download_future,
+                pdf_response_future,
+            },
+            timeout=ventetid_ms / 1_000,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if download_future in faerdige:
+            return (
+                "download",
+                download_future.result(),
+            )
+
+        if pdf_response_future in faerdige:
+            return (
+                "pdf_bytes",
+                pdf_response_future.result(),
+            )
+
+        raise TimeoutError(
+            "Der kom hverken download-event eller PDF-response."
+        )
+
+    async def hent_synlig_tekst() -> str:
+        try:
+            return " ".join(
+                (
+                    await page.locator("body").inner_text()
+                ).split()
+            )
+        except Exception:
+            return ""
+
+    try:
+        foerste_forsoeg_ms = max(
+            1,
+            int(timeout_ms * 0.60),
+        )
+        andet_forsoeg_ms = max(
+            1,
+            timeout_ms - foerste_forsoeg_ms,
+        )
+
+        logger.info(
+            "Bestiller rapporten og venter på download-event "
+            "eller PDF-response. Første forsøg=%s ms, "
+            "genforsøg=%s ms.",
+            foerste_forsoeg_ms,
+            andet_forsoeg_ms,
+        )
+
         await vis_rapport_knap.click()
 
-        await _vent_mellem_selector_actions(
-            page
-        )
-
-    rapport_side = await ny_side_info.value
-
-    await rapport_side.wait_for_load_state(
-        "domcontentloaded",
-        timeout=timeout_ms,
-    )
-
-    if await loading.count() > 0:
         try:
-            await loading.wait_for(
-                state="hidden",
-                timeout=timeout_ms,
-            )
-        except PlaywrightTimeoutError:
-            logger.debug(
-                "Rapport-loading kunne ikke længere findes "
-                "på den oprindelige side."
+            resultat_type, resultat = (
+                await vent_paa_rapportresultat(
+                    foerste_forsoeg_ms
+                )
             )
 
-    if rapport_side in sider_foer:
-        logger.warning(
-            "WebGIS genbrugte en eksisterende rapportfane."
+        except TimeoutError:
+            logger.warning(
+                "Første rapportbestilling gav hverken download, "
+                "PDF-response eller rapportfane. Udfører ét "
+                "kontrolleret genforsøg."
+            )
+
+            if not await vis_rapport_knap.is_visible():
+                await _vent_paa_synlig(
+                    rapport_knap,
+                    navn="Rapport-knappen ved genforsøg",
+                    timeout_ms=andet_forsoeg_ms,
+                )
+
+                await rapport_knap.click()
+
+                await _vent_mellem_selector_actions(
+                    page
+                )
+
+                vis_rapport_knap = page.locator(
+                    VIS_RAPPORT_KNAP
+                ).filter(
+                    has_text=re.compile(
+                        r"^\s*Vis rapport\s*$",
+                        re.IGNORECASE,
+                    )
+                ).first
+
+            overlay_arbejder = (
+                await loading.count() > 0
+                and await loading.is_visible()
+            )
+
+            if overlay_arbejder:
+                logger.warning(
+                    "WebGIS viser stadig 'Arbejder...'. "
+                    "Den oprindelige rapportbestilling kører "
+                    "derfor fortsat. Klikker ikke Vis rapport "
+                    "igen, men venter videre på download eller "
+                    "PDF-response."
+                )
+
+            else:
+                await _vent_paa_aktiv(
+                    vis_rapport_knap,
+                    navn="Vis rapport-knappen ved genforsøg",
+                    timeout_ms=andet_forsoeg_ms,
+                )
+
+                logger.info(
+                    "WebGIS arbejder ikke længere. "
+                    "Klikker Vis rapport igen."
+                )
+
+                await vis_rapport_knap.click(
+                    timeout=andet_forsoeg_ms,
+                )
+
+            try:
+                resultat_type, resultat = (
+                    await vent_paa_rapportresultat(
+                        andet_forsoeg_ms
+                    )
+                )
+
+            except TimeoutError as error:
+                popup_information = [
+                    {
+                        "url": _sikker_url(popup.url),
+                        "lukket": popup.is_closed(),
+                    }
+                    for popup in nye_sider
+                ]
+
+                synlig_tekst = await hent_synlig_tekst()
+
+                raise RuntimeError(
+                    "WebGIS leverede ikke en PDF efter to "
+                    "rapportbestillinger. "
+                    f"Samlet timeout={timeout_ms} ms. "
+                    f"Registrerede rapportfaner="
+                    f"{popup_information}. "
+                    f"Mulige PDF-responses="
+                    f"{mulige_pdf_svar[-10:]}. "
+                    f"Seneste netværksfejl="
+                    f"{netvaerksfejl[-10:]}. "
+                    f"Synlig WebGIS-tekst="
+                    f"{synlig_tekst[:2_000]!r}."
+                ) from error
+
+        rapport_side = page
+
+        for mulig_rapport_side in reversed(nye_sider):
+            if not mulig_rapport_side.is_closed():
+                rapport_side = mulig_rapport_side
+                break
+
+        if resultat_type == "download":
+            download = resultat
+
+            if not isinstance(download, Download):
+                raise RuntimeError(
+                    "Det registrerede downloadresultat "
+                    "havde en uventet type."
+                )
+
+            download_fejl = await download.failure()
+
+            if download_fejl:
+                raise RuntimeError(
+                    "WebGIS-downloadet fejlede: "
+                    f"{download_fejl}"
+                )
+
+            _RAPPORT_DOWNLOADS[
+                id(rapport_side)
+            ] = download
+
+            logger.info(
+                "Download-event modtaget. Foreslået filnavn: %s. "
+                "Rapportfane oprettet: %s.",
+                download.suggested_filename,
+                rapport_side is not page,
+            )
+
+        elif resultat_type == "pdf_bytes":
+            pdf_bytes = resultat
+
+            if not isinstance(pdf_bytes, bytes):
+                raise RuntimeError(
+                    "Det registrerede PDF-resultat var ikke bytes."
+                )
+
+            if not pdf_bytes.startswith(b"%PDF-"):
+                raise RuntimeError(
+                    "WebGIS-response mangler en gyldig "
+                    "PDF-signatur."
+                )
+
+            _RAPPORT_PDF_BYTES[
+                id(rapport_side)
+            ] = pdf_bytes
+
+            logger.info(
+                "PDF-response modtaget direkte fra WebGIS: "
+                "%s bytes. Rapportfane oprettet: %s.",
+                len(pdf_bytes),
+                rapport_side is not page,
+            )
+
+        else:
+            raise RuntimeError(
+                "WebGIS returnerede en ukendt rapporttype: "
+                f"{resultat_type!r}."
+            )
+
+        if await loading.count() > 0:
+            try:
+                await loading.wait_for(
+                    state="hidden",
+                    timeout=min(timeout_ms, 60_000),
+                )
+            except PlaywrightTimeoutError:
+                logger.debug(
+                    "Rapport-loading forsvandt ikke, men "
+                    "PDF-resultatet er allerede modtaget."
+                )
+
+        return rapport_side
+
+    finally:
+        page.context.remove_listener(
+            "page",
+            ved_ny_side,
+        )
+        page.context.remove_listener(
+            "response",
+            ved_response,
+        )
+        page.context.remove_listener(
+            "requestfailed",
+            ved_request_failed,
         )
 
-    await _vent_paa_pdf_url(
-        rapport_side=rapport_side,
-        timeout_ms=timeout_ms,
-    )
+        for listener_side in sider_med_download_listener:
+            try:
+                listener_side.remove_listener(
+                    "download",
+                    ved_download,
+                )
+            except Exception:
+                logger.debug(
+                    "Download-listeneren kunne ikke fjernes "
+                    "fra en WebGIS-side.",
+                    exc_info=True,
+                )
 
-    logger.info(
-        "PDF-rapporten er åbnet i en ny fane."
-    )
+        if response_tasks:
+            await asyncio.gather(
+                *response_tasks,
+                return_exceptions=True,
+            )
 
-    return rapport_side
-
+# ------------------------------------------------------------
+# SLUT: aabn_rapport
+# ------------------------------------------------------------
 
 # ------------------------------------------------------------
 # START: gem_rapport_pdf
@@ -835,292 +2234,102 @@ async def gem_rapport_pdf(
     timeout_ms: int = WEBGIS_RAPPORT_TIMEOUT_MS,
 ) -> Path:
     """
-    Henter PDF-rapporten gennem den autentificerede WebGIS-side.
+    Gemmer WebGIS-rapporten som PDF.
 
-    Browserens fetch-funktion bruges med credentials="include".
-    Dermed genbruges browserens eksisterende HTTP-login og cookies.
-
-    Parametre:
-        webgis_side:
-            Den oprindelige, autentificerede WebGIS-side.
-
-        rapport_side:
-            Den nye fane, som viser PDF-rapporten.
-
-        destination:
-            Stien, hvor PDF-filen skal gemmes.
-
-        timeout_ms:
-            Maksimal ventetid for hentning af PDF'en.
+    Rapporten kan komme fra et normalt Playwright-download eller fra
+    et direkte PDF-response. Der foretages ikke et nyt HTTP-kald.
 
     Output:
-        Path til den gemte PDF-fil.
+        Path til den gemte og validerede PDF-fil.
     """
+    _valider_page(webgis_side)
+    _valider_page(rapport_side)
 
-    _valider_page(
-        webgis_side
+    if (
+        isinstance(timeout_ms, bool)
+        or not isinstance(timeout_ms, int)
+    ):
+        raise TypeError(
+            "timeout_ms skal være et heltal."
+        )
+
+    if timeout_ms <= 0:
+        raise ValueError(
+            "timeout_ms skal være større end 0."
+        )
+
+    download = _RAPPORT_DOWNLOADS.pop(
+        id(rapport_side),
+        None,
     )
 
-    _valider_page(
-        rapport_side
+    pdf_bytes = _RAPPORT_PDF_BYTES.pop(
+        id(rapport_side),
+        None,
     )
 
-    destination_path = Path(
-        destination
-    )
+    if download is None and pdf_bytes is None:
+        raise RuntimeError(
+            "Der blev hverken registreret et download eller "
+            "et PDF-response til den aktuelle WebGIS-rapport."
+        )
+
+    destination_path = Path(destination)
 
     destination_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    await _vent_paa_pdf_url(
-        rapport_side=rapport_side,
-        timeout_ms=timeout_ms,
+    destination_path.unlink(
+        missing_ok=True
     )
 
-    rapport_url = str(
-        rapport_side.url or ""
-    ).strip()
-
-    if not rapport_url:
-        raise RuntimeError(
-            "Rapportfanen mangler en URL."
+    if download is not None:
+        logger.info(
+            "Gemmer PDF direkte fra browserens download-event."
         )
 
-    logger.info(
-        "Henter PDF-rapporten gennem den "
-        "autentificerede WebGIS-side."
-    )
-
-    browser_resultat = await webgis_side.evaluate(
-        """
-        async ({
-            rapportUrl,
-            timeoutMs
-        }) => {
-            const controller = new AbortController();
-
-            const timeoutHandle = setTimeout(
-                () => controller.abort(),
-                timeoutMs
-            );
-
-            try {
-                const response = await fetch(
-                    rapportUrl,
-                    {
-                        method: "GET",
-                        credentials: "include",
-                        headers: {
-                            "Accept": "application/pdf"
-                        },
-                        signal: controller.signal
-                    }
-                );
-
-                const contentType = (
-                    response.headers.get(
-                        "content-type"
-                    ) || ""
-                );
-
-                if (!response.ok) {
-                    return {
-                        ok: false,
-                        status: response.status,
-                        statusText: response.statusText,
-                        contentType: contentType,
-                        base64: "",
-                        browserError: ""
-                    };
-                }
-
-                const arrayBuffer =
-                    await response.arrayBuffer();
-
-                const bytes =
-                    new Uint8Array(arrayBuffer);
-
-                const chunkSize = 32_768;
-
-                let binaryText = "";
-
-                for (
-                    let index = 0;
-                    index < bytes.length;
-                    index += chunkSize
-                ) {
-                    const chunk = bytes.subarray(
-                        index,
-                        Math.min(
-                            index + chunkSize,
-                            bytes.length
-                        )
-                    );
-
-                    binaryText += (
-                        String.fromCharCode(...chunk)
-                    );
-                }
-
-                return {
-                    ok: true,
-                    status: response.status,
-                    statusText: response.statusText,
-                    contentType: contentType,
-                    base64: btoa(binaryText),
-                    byteLength: bytes.length,
-                    browserError: ""
-                };
-            } catch (error) {
-                return {
-                    ok: false,
-                    status: 0,
-                    statusText: "",
-                    contentType: "",
-                    base64: "",
-                    byteLength: 0,
-                    browserError: (
-                        error instanceof Error
-                            ? (
-                                error.name
-                                + ": "
-                                + error.message
-                            )
-                            : String(error)
-                    )
-                };
-            } finally {
-                clearTimeout(
-                    timeoutHandle
-                );
-            }
-        }
-        """,
-        {
-            "rapportUrl": rapport_url,
-            "timeoutMs": timeout_ms,
-        },
-    )
-
-    if not isinstance(
-        browser_resultat,
-        dict,
-    ):
-        raise RuntimeError(
-            "WebGIS returnerede et ugyldigt resultat "
-            "ved hentning af PDF-rapporten."
+        await download.save_as(
+            str(destination_path)
         )
 
-    browserfejl = str(
-        browser_resultat.get(
-            "browserError"
-        )
-        or ""
-    ).strip()
-
-    if browserfejl:
-        raise RuntimeError(
-            "PDF-rapporten kunne ikke hentes gennem "
-            "WebGIS-browseren. "
-            f"Browserfejl: {browserfejl}"
-        )
-
-    status = browser_resultat.get(
-        "status"
-    )
-
-    if not browser_resultat.get(
-        "ok"
-    ):
-        raise RuntimeError(
-            "PDF-rapporten kunne ikke hentes gennem "
-            "WebGIS-browseren. "
-            f"HTTP-status: {status}. "
-            f"Statusbesked: "
-            f"{browser_resultat.get('statusText')!s}. "
-            f"URL: {_sikker_url(rapport_url)}"
-        )
-
-    base64_pdf = str(
-        browser_resultat.get(
-            "base64"
-        )
-        or ""
-    ).strip()
-
-    if not base64_pdf:
-        raise RuntimeError(
-            "WebGIS returnerede et tomt PDF-resultat."
-        )
-
-    try:
-        import base64
-
-        pdf_bytes = base64.b64decode(
-            base64_pdf,
-            validate=True,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "PDF-resultatet fra WebGIS kunne ikke "
-            "Base64-dekodes."
-        ) from exc
-
-    if not pdf_bytes.startswith(
-        b"%PDF-"
-    ):
-        content_type = str(
-            browser_resultat.get(
-                "contentType"
+    else:
+        if not isinstance(pdf_bytes, bytes):
+            raise RuntimeError(
+                "WebGIS PDF-response havde en uventet datatype."
             )
-            or ""
-        ).strip()
 
-        raise RuntimeError(
-            "WebGIS returnerede ikke en gyldig PDF. "
-            f"Content-Type var {content_type!r}, "
-            "og filen manglede PDF-signaturen."
+        logger.info(
+            "Gemmer PDF direkte fra WebGIS-response."
         )
 
-    destination_path.write_bytes(
-        pdf_bytes
-    )
+        destination_path.write_bytes(pdf_bytes)
 
-    gemt_filstoerrelse = (
-        destination_path.stat().st_size
-    )
+    if not destination_path.is_file():
+        raise RuntimeError(
+            "WebGIS-rapporten blev ikke gemt."
+        )
+
+    gemt_filstoerrelse = destination_path.stat().st_size
 
     if gemt_filstoerrelse == 0:
+        destination_path.unlink(missing_ok=True)
         raise RuntimeError(
-            "Den gemte PDF-rapport er tom."
+            "Den gemte WebGIS-rapport er tom."
         )
 
-    forventet_filstoerrelse = (
-        browser_resultat.get(
-            "byteLength"
-        )
-    )
+    with destination_path.open("rb") as pdf_fil:
+        pdf_signatur = pdf_fil.read(5)
 
-    if (
-        isinstance(
-            forventet_filstoerrelse,
-            int,
-        )
-        and forventet_filstoerrelse > 0
-        and gemt_filstoerrelse
-        != forventet_filstoerrelse
-    ):
+    if pdf_signatur != b"%PDF-":
+        destination_path.unlink(missing_ok=True)
         raise RuntimeError(
-            "Den gemte PDF-fil har ikke den "
-            "forventede størrelse. "
-            f"Forventede {forventet_filstoerrelse} bytes, "
-            f"men gemte {gemt_filstoerrelse} bytes."
+            "Den gemte fil mangler en gyldig PDF-signatur."
         )
 
     logger.info(
-        "PDF-rapporten er gemt med %s bytes.",
+        "WebGIS-PDF gemt og valideret: %s bytes.",
         gemt_filstoerrelse,
     )
 
@@ -2586,6 +3795,2169 @@ RAPPORT_LOADING_TEKST = (
 )
 ===== ./q_webgis/tests_local/__init__.py =====
 
+===== ./q_webgis/tests_local/test_aendr_baadplads_status.py =====
+from __future__ import annotations
+
+import asyncio
+import logging
+from pprint import pprint
+from typing import Any
+from urllib.parse import urlparse
+
+from automation_server_client import (
+    AutomationServer,
+    Credential,
+)
+from dotenv import load_dotenv
+from playwright.async_api import (
+    Page,
+    Request,
+)
+
+from q_haderslev_vbo.playwright.browser_session import (
+    BrowserSession,
+)
+from q_webgis.configuration import (
+    WEBGIS_CREDENTIAL_NAME,
+    WEBGIS_TIMEOUT_MS,
+    WEBGIS_URL,
+)
+from q_webgis.functionality.baadplads_status import (
+    DRIFTSTATUS_FRI,
+    DRIFTSTATUS_UDLEJET,
+    aendr_baadplads_status,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------
+# Browser
+# ------------------------------------------------------------
+
+HEADLESS = False
+DEBUG = True
+
+
+# ------------------------------------------------------------
+# Ticket
+# ------------------------------------------------------------
+
+WEBGIS_HOSTNAME = (
+    urlparse(WEBGIS_URL).hostname
+    or ""
+).casefold()
+
+TICKET_HEADER_NAME = "ticket"
+TICKET_TIMEOUT_SECONDS = 300
+
+
+# ------------------------------------------------------------
+# Vælg målstatus her
+# ------------------------------------------------------------
+#
+# Skift KUN denne ene linje:
+#
+#MAAL_DRIFTSTATUS = DRIFTSTATUS_FRI
+#
+# eller:
+#
+MAAL_DRIFTSTATUS = DRIFTSTATUS_UDLEJET
+#
+# ------------------------------------------------------------
+
+#MAAL_DRIFTSTATUS = DRIFTSTATUS_FRI
+
+
+# ------------------------------------------------------------
+# Statusopsætning
+# ------------------------------------------------------------
+
+DRIFTSTATUS_LABELS = {
+    DRIFTSTATUS_FRI: "Fri",
+    DRIFTSTATUS_UDLEJET: "Udlejet",
+}
+
+TILLADTE_TESTSTATUSSER = {
+    DRIFTSTATUS_FRI,
+    DRIFTSTATUS_UDLEJET,
+}
+
+
+def find_modsat_driftstatus(
+    maal_driftstatus: str,
+) -> str:
+    """
+    Finder testens forventede startstatus.
+
+    Testen understøtter kun skift mellem:
+
+        1 = Fri
+        3 = Udlejet
+
+    Output:
+        Den modsatte statuskode.
+    """
+    if maal_driftstatus == DRIFTSTATUS_FRI:
+        return DRIFTSTATUS_UDLEJET
+
+    if maal_driftstatus == DRIFTSTATUS_UDLEJET:
+        return DRIFTSTATUS_FRI
+
+    raise ValueError(
+        "MAAL_DRIFTSTATUS skal være "
+        "DRIFTSTATUS_FRI eller DRIFTSTATUS_UDLEJET."
+    )
+
+
+FORVENTET_START_DRIFTSTATUS = (
+    find_modsat_driftstatus(
+        MAAL_DRIFTSTATUS
+    )
+)
+
+MAAL_DRIFTSTATUS_LABEL = (
+    DRIFTSTATUS_LABELS[
+        MAAL_DRIFTSTATUS
+    ]
+)
+
+START_DRIFTSTATUS_LABEL = (
+    DRIFTSTATUS_LABELS[
+        FORVENTET_START_DRIFTSTATUS
+    ]
+)
+
+
+# ------------------------------------------------------------
+# Testdata
+# ------------------------------------------------------------
+
+FORVENTET_OGC_FID = 289
+FORVENTET_PLADS = "HHHHHH"
+
+
+BAADPLADS_FEATURE: dict[str, Any] = {
+    "wkt": (
+        "POLYGON ((497280.8 6127633.6, "
+        "498253.6 6129476.8, "
+        "499840.8 6128811.2, "
+        "498816.8 6127172.8, "
+        "497280.8 6127633.6))"
+    ),
+    "projection": "EPSG:25832",
+    "hasattachments": False,
+    "attributes": {
+        "vinkel": None,
+        "havn": "Havn",
+        "plads_tal": None,
+        "bem": None,
+        "plads_old": None,
+        "baad_lngd": None,
+        "medejer": None,
+        "postnr": None,
+        "bynavn": None,
+        "plads_ny": None,
+        "straekning": "Sydhavn",
+        "deb_adresse": None,
+        "baad_dybd": None,
+        "deb_navn": None,
+        "email": None,
+        "skurnr": None,
+        "forsikringspolice": None,
+        "redigeringsdato": None,
+        "baad_bred": None,
+        "cpr": None,
+        "tlf_nr": None,
+        "baadnavn": None,
+        "plads": "HHHHHH",
+        "skurtype": None,
+        "acadrenr": None,
+        "driftstatus": (
+            FORVENTET_START_DRIFTSTATUS
+        ),
+        "status_label": None,
+        "forsikring": None,
+        "ogc_fid": 289,
+    },
+}
+
+
+# ------------------------------------------------------------
+# Credentials
+# ------------------------------------------------------------
+
+def hent_webgis_http_credentials() -> dict[str, str]:
+    """
+    Henter WebGIS HTTP-login fra Automation Server.
+
+    Output:
+        Dictionary med username og password til BrowserSession.
+
+    Sikkerhed:
+        Brugernavnet logges.
+        Adgangskoden bliver aldrig logget.
+    """
+    AutomationServer.from_environment()
+
+    credential = Credential.get_credential(
+        WEBGIS_CREDENTIAL_NAME
+    )
+
+    username = str(
+        credential.username
+        or ""
+    ).strip()
+
+    password = str(
+        credential.password
+        or ""
+    )
+
+    if not username:
+        raise ValueError(
+            f"Credentialen {WEBGIS_CREDENTIAL_NAME!r} "
+            "mangler username."
+        )
+
+    if not password:
+        raise ValueError(
+            f"Credentialen {WEBGIS_CREDENTIAL_NAME!r} "
+            "mangler password."
+        )
+
+    logger.info(
+        "WebGIS HTTP-credential %r er hentet. "
+        "Brugernavn: %s.",
+        WEBGIS_CREDENTIAL_NAME,
+        username,
+    )
+
+    return {
+        "username": username,
+        "password": password,
+    }
+
+
+# ------------------------------------------------------------
+# Ticket-listener
+# ------------------------------------------------------------
+
+def opret_ticket_listener(
+    page: Page,
+) -> asyncio.Future[str]:
+    """
+    Opsnapper Ticket-headeren fra WebGIS' egne requests.
+
+    Listeneren skal oprettes før navigationen.
+
+    Output:
+        Future med ticketværdien.
+
+    Sikkerhed:
+        Ticketværdien bliver aldrig logget.
+    """
+    event_loop = asyncio.get_running_loop()
+
+    ticket_future: asyncio.Future[str] = (
+        event_loop.create_future()
+    )
+
+    async def kontroller_request(
+        request: Request,
+    ) -> None:
+        if ticket_future.done():
+            return
+
+        request_hostname = (
+            urlparse(request.url).hostname
+            or ""
+        ).casefold()
+
+        if request_hostname != WEBGIS_HOSTNAME:
+            return
+
+        try:
+            headers = await request.all_headers()
+        except Exception as exc:
+            logger.debug(
+                "Headers kunne ikke læses fra "
+                "WebGIS-request: %s",
+                exc,
+            )
+            return
+
+        ticket = str(
+            headers.get(
+                TICKET_HEADER_NAME,
+                "",
+            )
+            or ""
+        ).strip()
+
+        if (
+            ticket
+            and not ticket_future.done()
+        ):
+            logger.info(
+                "WebGIS Ticket-headeren er fundet."
+            )
+
+            ticket_future.set_result(
+                ticket
+            )
+
+    def ved_request(
+        request: Request,
+    ) -> None:
+        task = asyncio.create_task(
+            kontroller_request(
+                request
+            )
+        )
+
+        task.add_done_callback(
+            _log_ticket_listenerfejl
+        )
+
+    page.on(
+        "request",
+        ved_request,
+    )
+
+    return ticket_future
+
+
+def _log_ticket_listenerfejl(
+    completed_task: asyncio.Task[None],
+) -> None:
+    """
+    Logger eventuelle fejl fra ticket-listeneren.
+    """
+    if completed_task.cancelled():
+        return
+
+    try:
+        exception = completed_task.exception()
+    except asyncio.CancelledError:
+        return
+
+    if exception is not None:
+        logger.error(
+            "Fejl i ticket-listeneren: %s",
+            exception,
+            exc_info=(
+                type(exception),
+                exception,
+                exception.__traceback__,
+            ),
+        )
+
+
+async def vent_paa_ticket(
+    ticket_future: asyncio.Future[str],
+    *,
+    timeout_seconds: int = TICKET_TIMEOUT_SECONDS,
+) -> str:
+    """
+    Venter på WebGIS-ticketen.
+
+    Output:
+        Ticketværdien.
+
+    Sikkerhed:
+        Ticketværdien bliver aldrig logget.
+    """
+    logger.info(
+        "Venter på WebGIS Ticket-headeren."
+    )
+
+    try:
+        ticket = await asyncio.wait_for(
+            asyncio.shield(
+                ticket_future
+            ),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "WebGIS Ticket-headeren blev ikke "
+            f"fundet inden for {timeout_seconds} "
+            "sekunder. Åbn bådpladsen og aktivér "
+            "redigeringsvisningen."
+        ) from exc
+
+    ticket = str(
+        ticket
+        or ""
+    ).strip()
+
+    if not ticket:
+        raise RuntimeError(
+            "Ticket-listeneren returnerede "
+            "en tom ticket."
+        )
+
+    return ticket
+
+
+# ------------------------------------------------------------
+# WebGIS-navigation
+# ------------------------------------------------------------
+
+async def launch_webgis(
+    page: Page,
+) -> Page:
+    """
+    Åbner WebGIS i den autentificerede BrowserSession.
+
+    Output:
+        Den åbne Playwright-side.
+    """
+    logger.info(
+        "Åbner WebGIS."
+    )
+
+    response = await page.goto(
+        WEBGIS_URL,
+        wait_until="domcontentloaded",
+        timeout=WEBGIS_TIMEOUT_MS,
+    )
+
+    if response is None:
+        raise RuntimeError(
+            "Navigationen til WebGIS returnerede "
+            "ikke et HTTP-svar."
+        )
+
+    if not response.ok:
+        raise RuntimeError(
+            "WebGIS afviste navigationen med "
+            f"HTTP-status {response.status}."
+        )
+
+    logger.info(
+        "WebGIS er åbnet med HTTP-status %s.",
+        response.status,
+    )
+
+    return page
+
+
+# ------------------------------------------------------------
+# Testvalidering
+# ------------------------------------------------------------
+
+def valider_testopsætning() -> None:
+    """
+    Kontrollerer statusvalg og featureidentifikation.
+    """
+    if (
+        MAAL_DRIFTSTATUS
+        not in TILLADTE_TESTSTATUSSER
+    ):
+        raise ValueError(
+            "MAAL_DRIFTSTATUS skal være "
+            "DRIFTSTATUS_FRI eller "
+            "DRIFTSTATUS_UDLEJET."
+        )
+
+    attributes = BAADPLADS_FEATURE.get(
+        "attributes"
+    )
+
+    if not isinstance(
+        attributes,
+        dict,
+    ):
+        raise TypeError(
+            "BAADPLADS_FEATURE mangler en gyldig "
+            "attributes-dictionary."
+        )
+
+    ogc_fid = attributes.get(
+        "ogc_fid"
+    )
+
+    plads = str(
+        attributes.get("plads")
+        or ""
+    ).strip()
+
+    start_driftstatus = str(
+        attributes.get("driftstatus")
+        or ""
+    ).strip()
+
+    if ogc_fid != FORVENTET_OGC_FID:
+        raise AssertionError(
+            "Testfeature har et uventet ogc_fid. "
+            f"Forventet: {FORVENTET_OGC_FID}. "
+            f"Aktuelt: {ogc_fid!r}."
+        )
+
+    if plads != FORVENTET_PLADS:
+        raise AssertionError(
+            "Testfeature har en uventet plads. "
+            f"Forventet: {FORVENTET_PLADS!r}. "
+            f"Aktuelt: {plads!r}."
+        )
+
+    if (
+        start_driftstatus
+        != FORVENTET_START_DRIFTSTATUS
+    ):
+        raise AssertionError(
+            "Featureobjektets startstatus svarer ikke "
+            "til den automatisk beregnede startstatus. "
+            f"Forventet: {FORVENTET_START_DRIFTSTATUS!r}. "
+            f"Aktuelt: {start_driftstatus!r}."
+        )
+
+    if (
+        start_driftstatus
+        == MAAL_DRIFTSTATUS
+    ):
+        raise AssertionError(
+            "Startstatus og målstatus må ikke være ens."
+        )
+
+
+def valider_opdateringsresultat(
+    resultat: dict[str, Any],
+) -> None:
+    """
+    Kontrollerer resultatet fra statusændringen.
+    """
+    if not isinstance(
+        resultat,
+        dict,
+    ):
+        raise TypeError(
+            "aendr_baadplads_status() skal "
+            "returnere en dictionary."
+        )
+
+    if resultat.get("success") is not True:
+        raise AssertionError(
+            "Statusændringen blev ikke markeret "
+            "som gennemført."
+        )
+
+    if (
+        resultat.get("ogc_fid")
+        != FORVENTET_OGC_FID
+    ):
+        raise AssertionError(
+            "Resultatet indeholder et uventet "
+            "ogc_fid."
+        )
+
+    tidligere_driftstatus = str(
+        resultat.get(
+            "tidligere_driftstatus"
+        )
+        or ""
+    ).strip()
+
+    ny_driftstatus = str(
+        resultat.get(
+            "ny_driftstatus"
+        )
+        or ""
+    ).strip()
+
+    if (
+        tidligere_driftstatus
+        != FORVENTET_START_DRIFTSTATUS
+    ):
+        raise AssertionError(
+            "Resultatet indeholder en uventet "
+            "tidligere driftstatus. "
+            f"Forventet: "
+            f"{FORVENTET_START_DRIFTSTATUS!r}. "
+            f"Aktuelt: {tidligere_driftstatus!r}."
+        )
+
+    if ny_driftstatus != MAAL_DRIFTSTATUS:
+        raise AssertionError(
+            "Resultatet indeholder ikke den valgte "
+            "målstatus. "
+            f"Forventet: {MAAL_DRIFTSTATUS!r}. "
+            f"Aktuelt: {ny_driftstatus!r}."
+        )
+
+
+# ------------------------------------------------------------
+# Integrationstest
+# ------------------------------------------------------------
+
+async def test_aendr_baadplads_status() -> None:
+    """
+    Skifter testbådpladsen mellem Fri og Udlejet.
+
+    Den ønskede målstatus styres af MAAL_DRIFTSTATUS øverst
+    i testfilen.
+
+    Dette er en skrivende integrationstest, som ændrer rigtige
+    data i WebGIS for ogc_fid=289.
+    """
+    load_dotenv()
+
+    valider_testopsætning()
+
+    logger.info("=" * 70)
+    logger.info(
+        "STARTER SKRIVENDE BÅDPLADSSTATUS-TEST"
+    )
+    logger.info(
+        "Bådplads: ogc_fid=%s, plads=%r.",
+        FORVENTET_OGC_FID,
+        FORVENTET_PLADS,
+    )
+    logger.info(
+        "Statusændring: %s (%s) -> %s (%s).",
+        START_DRIFTSTATUS_LABEL,
+        FORVENTET_START_DRIFTSTATUS,
+        MAAL_DRIFTSTATUS_LABEL,
+        MAAL_DRIFTSTATUS,
+    )
+    logger.info("=" * 70)
+
+    http_credentials = (
+        hent_webgis_http_credentials()
+    )
+
+    session = BrowserSession(
+        headless=HEADLESS,
+        debug=DEBUG,
+        http_credentials=http_credentials,
+    )
+
+    page: Page | None = None
+
+    try:
+        await session.start()
+
+        page = await session.new_page()
+
+        ticket_future = opret_ticket_listener(
+            page
+        )
+
+        await launch_webgis(
+            page
+        )
+
+        print()
+        print("=" * 80)
+        print("VENTER PÅ WEBGIS-TICKET")
+        print("=" * 80)
+        print()
+        print(
+            f"Testen ændrer {FORVENTET_PLADS} "
+            f"fra {START_DRIFTSTATUS_LABEL} "
+            f"til {MAAL_DRIFTSTATUS_LABEL}."
+        )
+        print()
+        print(
+            "1. Find bådpladsen med plads HHHHHH."
+        )
+        print(
+            "2. Åbn bådpladsens redigeringsvisning."
+        )
+        print(
+            "3. Du skal ikke gemme manuelt."
+        )
+        print(
+            "4. Testen fortsætter automatisk, når "
+            "Ticket-headeren er fundet."
+        )
+        print()
+        print("=" * 80)
+
+        ticket = await vent_paa_ticket(
+            ticket_future
+        )
+
+        logger.info(
+            "Ticketen er klar. Sender statusændring "
+            "til %s.",
+            MAAL_DRIFTSTATUS_LABEL,
+        )
+
+        resultat = await aendr_baadplads_status(
+            page=page,
+            ticket=ticket,
+            baadplads_feature=BAADPLADS_FEATURE,
+            ny_driftstatus=MAAL_DRIFTSTATUS,
+        )
+
+        valider_opdateringsresultat(
+            resultat
+        )
+
+        print()
+        print("=" * 80)
+        print("BÅDPLADSSTATUS ER ÆNDRET")
+        print("=" * 80)
+        print()
+        print(
+            f"Plads: {FORVENTET_PLADS}"
+        )
+        print(
+            f"ogc_fid: {FORVENTET_OGC_FID}"
+        )
+        print(
+            "Tidligere status: "
+            f"{START_DRIFTSTATUS_LABEL} "
+            f"({FORVENTET_START_DRIFTSTATUS})"
+        )
+        print(
+            "Ny status: "
+            f"{MAAL_DRIFTSTATUS_LABEL} "
+            f"({MAAL_DRIFTSTATUS})"
+        )
+        print()
+        print("Komplet resultat:")
+        print()
+
+        pprint(
+            resultat,
+            width=120,
+            sort_dicts=False,
+        )
+
+        print("=" * 80)
+
+        logger.info(
+            "Statusændringen blev gennemført. "
+            "ogc_fid=%s, ny status=%s (%s).",
+            FORVENTET_OGC_FID,
+            MAAL_DRIFTSTATUS_LABEL,
+            MAAL_DRIFTSTATUS,
+        )
+
+    except Exception:
+        logger.exception(
+            "Testen af statusændring til %s fejlede.",
+            MAAL_DRIFTSTATUS_LABEL,
+        )
+
+        if (
+            page is not None
+            and not page.is_closed()
+        ):
+            try:
+                await session.screenshot(
+                    page,
+                    (
+                        "FEJL_aendr_baadplads_til_"
+                        + MAAL_DRIFTSTATUS_LABEL.casefold()
+                    ),
+                    always=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Fejlscreenshot kunne ikke gemmes."
+                )
+
+        raise
+
+    finally:
+        logger.info(
+            "Lukker WebGIS-side og BrowserSession."
+        )
+
+        if (
+            page is not None
+            and not page.is_closed()
+        ):
+            try:
+                await session.close_page(
+                    page
+                )
+            except Exception:
+                logger.exception(
+                    "WebGIS-siden kunne ikke lukkes."
+                )
+
+        try:
+            await session.close()
+        except Exception:
+            logger.exception(
+                "BrowserSession kunne ikke lukkes."
+            )
+
+
+# ------------------------------------------------------------
+# Lokal start
+# ------------------------------------------------------------
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s [%(levelname)s] "
+            "%(name)s: %(message)s"
+        ),
+        force=True,
+    )
+
+    logging.getLogger(
+        "httpx"
+    ).setLevel(logging.WARNING)
+
+    logging.getLogger(
+        "httpcore"
+    ).setLevel(logging.WARNING)
+
+    logging.getLogger(
+        "automation_server_client"
+    ).setLevel(logging.WARNING)
+
+    logging.getLogger(
+        "debugpy"
+    ).setLevel(logging.WARNING)
+
+    asyncio.run(
+        test_aendr_baadplads_status()
+    )
+===== ./q_webgis/tests_local/test_hent_baadpladser.py =====
+from __future__ import annotations
+
+import asyncio
+import logging
+from pprint import pprint
+from typing import Any
+from urllib.parse import urlparse
+
+from automation_server_client import (
+    AutomationServer,
+    Credential,
+)
+from dotenv import load_dotenv
+from playwright.async_api import (
+    Page,
+    Request,
+)
+
+from q_haderslev_vbo.playwright.browser_session import (
+    BrowserSession,
+)
+from q_webgis.configuration import (
+    WEBGIS_CREDENTIAL_NAME,
+    WEBGIS_TIMEOUT_MS,
+    WEBGIS_URL,
+)
+from q_webgis.functionality.baadpladser import (
+    hent_baadpladser,
+)
+from q_webgis.functionality.spatialanalyze import (
+    spatialanalyze,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------
+# Browser
+# ------------------------------------------------------------
+
+HEADLESS = False
+DEBUG = True
+
+
+# ------------------------------------------------------------
+# WebGIS-session
+# ------------------------------------------------------------
+
+WEBGIS_BASE_URL = (
+    "https://webgis.intern.udcit.dk"
+)
+
+WEBGIS_HOSTNAME = (
+    urlparse(WEBGIS_BASE_URL).hostname
+    or ""
+).casefold()
+
+JSESSIONID_COOKIE_NAME = "JSESSIONID"
+SESSION_ID_HEADER_NAME = "session-id"
+
+SESSION_TIMEOUT_SECONDS = 60
+
+
+# ------------------------------------------------------------
+# Bådpladsanalyse
+# ------------------------------------------------------------
+
+BAADPLADS_DATASOURCE = "ds-baadplads"
+
+# Udvidet analyseområde, så alle relevante bådpladser dækkes.
+BAADPLADS_MIN_X_WC = 497280.8
+BAADPLADS_MIN_Y_WC = 6109448.90332825
+BAADPLADS_MAX_X_WC = 546509.55
+BAADPLADS_MAX_Y_WC = 6129476.8
+
+# Genbruger repositoryets centrale rækkegrænse.
+BAADPLADS_MAXROWS = 500
+
+BAADPLADS_COMMAND = "read-spatial"
+BAADPLADS_SPATIAL_EXPRESSION = "this"
+
+BAADPLADS_JSONTYPES = "true"
+BAADPLADS_OUTPUTFORMAT = "json"
+BAADPLADS_ERROR_CONTENT_TYPE = "json"
+BAADPLADS_PROFILE = "maxi"
+
+
+# ------------------------------------------------------------
+# Testindstillinger
+# ------------------------------------------------------------
+
+ANTAL_RAEKKER_TIL_VISNING = 5
+
+# Den tidligere observerede værdi var 138.
+# Testen fejler ikke, hvis antallet senere ændrer sig.
+TIDLIGERE_OBSERVERET_ROWCOUNT = 138
+
+
+# ------------------------------------------------------------
+# Credentials
+# ------------------------------------------------------------
+
+def hent_webgis_http_credentials() -> dict[str, str]:
+    """
+    Henter WebGIS-login fra Automation Server.
+
+    Output:
+        Dictionary med username og password til BrowserSession.
+
+    Sikkerhed:
+        Username og password bliver ikke logget.
+    """
+    AutomationServer.from_environment()
+
+    credential = Credential.get_credential(
+        WEBGIS_CREDENTIAL_NAME
+    )
+
+    username = str(
+        credential.username
+        or ""
+    ).strip()
+
+    password = str(
+        credential.password
+        or ""
+    )
+
+    if not username:
+        raise ValueError(
+            f"Credentialen {WEBGIS_CREDENTIAL_NAME!r} "
+            "mangler username."
+        )
+
+    if not password:
+        raise ValueError(
+            f"Credentialen {WEBGIS_CREDENTIAL_NAME!r} "
+            "mangler password."
+        )
+
+    logger.info(
+        "WebGIS HTTP-credentialen er hentet."
+    )
+
+    return {
+        "username": username,
+        "password": password,
+    }
+
+
+# ------------------------------------------------------------
+# Session-Id-listener
+# ------------------------------------------------------------
+
+def opret_session_id_listener(
+    page: Page,
+) -> asyncio.Future[str]:
+    """
+    Finder Session-Id i WebGIS' egne requests.
+
+    Listeneren skal oprettes før navigationen til WebGIS.
+
+    Output:
+        En Future, som får Session-Id som resultat.
+
+    Sikkerhed:
+        Session-Id bliver ikke logget.
+    """
+    event_loop = asyncio.get_running_loop()
+
+    session_id_future: asyncio.Future[str] = (
+        event_loop.create_future()
+    )
+
+    async def kontroller_request(
+        request: Request,
+    ) -> None:
+        if session_id_future.done():
+            return
+
+        request_hostname = (
+            urlparse(request.url).hostname
+            or ""
+        ).casefold()
+
+        if request_hostname != WEBGIS_HOSTNAME:
+            return
+
+        try:
+            headers = await request.all_headers()
+        except Exception as exc:
+            logger.debug(
+                "Headers kunne ikke læses fra "
+                "WebGIS-request: %s",
+                exc,
+            )
+            return
+
+        session_id = str(
+            headers.get(
+                SESSION_ID_HEADER_NAME,
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not session_id:
+            return
+
+        if session_id_future.done():
+            return
+
+        logger.info(
+            "WebGIS Session-Id er fundet."
+        )
+
+        session_id_future.set_result(
+            session_id
+        )
+
+    def ved_request(
+        request: Request,
+    ) -> None:
+        task = asyncio.create_task(
+            kontroller_request(
+                request
+            )
+        )
+
+        task.add_done_callback(
+            _log_listenerfejl
+        )
+
+    page.on(
+        "request",
+        ved_request,
+    )
+
+    return session_id_future
+
+
+def _log_listenerfejl(
+    completed_task: asyncio.Task[None],
+) -> None:
+    """
+    Logger fejl fra Session-Id-listeneren.
+    """
+    if completed_task.cancelled():
+        return
+
+    try:
+        exception = completed_task.exception()
+    except asyncio.CancelledError:
+        return
+
+    if exception is not None:
+        logger.error(
+            "Fejl i Session-Id-listeneren: %s",
+            exception,
+            exc_info=(
+                type(exception),
+                exception,
+                exception.__traceback__,
+            ),
+        )
+
+
+async def vent_paa_session_id(
+    session_id_future: asyncio.Future[str],
+    *,
+    timeout_seconds: int = SESSION_TIMEOUT_SECONDS,
+) -> str:
+    """
+    Venter på Session-Id fra WebGIS' egne requests.
+
+    Output:
+        Den fundne Session-Id.
+
+    Sikkerhed:
+        Session-Id bliver ikke logget.
+    """
+    logger.info(
+        "Venter på WebGIS Session-Id."
+    )
+
+    try:
+        session_id = await asyncio.wait_for(
+            asyncio.shield(
+                session_id_future
+            ),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "WebGIS blev åbnet, men Session-Id blev "
+            f"ikke fundet inden for {timeout_seconds} "
+            "sekunder."
+        ) from exc
+
+    session_id = str(
+        session_id
+        or ""
+    ).strip()
+
+    if not session_id:
+        raise RuntimeError(
+            "Session-Id-listeneren returnerede "
+            "en tom værdi."
+        )
+
+    return session_id
+
+
+# ------------------------------------------------------------
+# WebGIS-navigation
+# ------------------------------------------------------------
+
+async def launch_webgis(
+    page: Page,
+) -> Page:
+    """
+    Åbner WebGIS i den eksisterende BrowserSession.
+
+    Output:
+        Den samme Playwright-side efter navigationen.
+    """
+    logger.info(
+        "Åbner WebGIS."
+    )
+
+    response = await page.goto(
+        WEBGIS_URL,
+        wait_until="domcontentloaded",
+        timeout=WEBGIS_TIMEOUT_MS,
+    )
+
+    if response is None:
+        raise RuntimeError(
+            "Navigationen til WebGIS returnerede "
+            "ikke et HTTP-svar."
+        )
+
+    if not response.ok:
+        raise RuntimeError(
+            "WebGIS afviste navigationen med "
+            f"HTTP-status {response.status}."
+        )
+
+    logger.info(
+        "WebGIS er åbnet med HTTP-status %s.",
+        response.status,
+    )
+
+    return page
+
+
+# ------------------------------------------------------------
+# JSESSIONID
+# ------------------------------------------------------------
+
+async def vent_paa_jsessionid(
+    page: Page,
+    *,
+    timeout_seconds: int = SESSION_TIMEOUT_SECONDS,
+) -> None:
+    """
+    Venter på WebGIS-sessionens JSESSIONID-cookie.
+
+    Cookieværdien bliver ikke returneret eller logget.
+    """
+    logger.info(
+        "Venter på WebGIS-sessionens JSESSIONID."
+    )
+
+    event_loop = asyncio.get_running_loop()
+
+    deadline = (
+        event_loop.time()
+        + timeout_seconds
+    )
+
+    while event_loop.time() < deadline:
+        cookies = await page.context.cookies(
+            [WEBGIS_BASE_URL]
+        )
+
+        har_jsessionid = any(
+            (
+                str(
+                    cookie.get(
+                        "name",
+                        "",
+                    )
+                ).casefold()
+                == JSESSIONID_COOKIE_NAME.casefold()
+                and bool(
+                    cookie.get("value")
+                )
+            )
+            for cookie in cookies
+        )
+
+        if har_jsessionid:
+            logger.info(
+                "WebGIS-sessionens JSESSIONID "
+                "er fundet."
+            )
+            return
+
+        await asyncio.sleep(
+            0.5
+        )
+
+    raise RuntimeError(
+        "WebGIS blev åbnet, men JSESSIONID blev "
+        f"ikke fundet inden for {timeout_seconds} "
+        "sekunder."
+    )
+
+
+# ------------------------------------------------------------
+# Analysevalidering
+# ------------------------------------------------------------
+
+def find_rowcount(
+    value: Any,
+) -> int | None:
+    """
+    Finder det første læsbare rowcount-felt rekursivt.
+
+    Output:
+        Rowcount som heltal eller None, hvis feltet ikke findes.
+    """
+    if isinstance(
+        value,
+        dict,
+    ):
+        for key, nested_value in value.items():
+            if str(key).casefold() == "rowcount":
+                try:
+                    rowcount = int(
+                        nested_value
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    raise ValueError(
+                        "Analysens rowcount kunne ikke "
+                        "konverteres til et heltal."
+                    ) from exc
+
+                return rowcount
+
+        for nested_value in value.values():
+            found_rowcount = find_rowcount(
+                nested_value
+            )
+
+            if found_rowcount is not None:
+                return found_rowcount
+
+    elif isinstance(
+        value,
+        list,
+    ):
+        for nested_value in value:
+            found_rowcount = find_rowcount(
+                nested_value
+            )
+
+            if found_rowcount is not None:
+                return found_rowcount
+
+    return None
+
+
+def valider_analyseresultat(
+    analyseresultat: dict[str, Any],
+) -> int:
+    """
+    Validerer spatialanalyze-resultatet.
+
+    Output:
+        Analysens rowcount som heltal.
+    """
+    if not isinstance(
+        analyseresultat,
+        dict,
+    ):
+        raise TypeError(
+            "spatialanalyze() skal returnere "
+            "en dictionary."
+        )
+
+    if not analyseresultat:
+        raise AssertionError(
+            "spatialanalyze() returnerede et "
+            "tomt resultat."
+        )
+
+    rowcount = find_rowcount(
+        analyseresultat
+    )
+
+    if rowcount is None:
+        raise AssertionError(
+            "Analysesvaret indeholder ikke et "
+            "læsbart rowcount-felt."
+        )
+
+    if rowcount < 0:
+        raise AssertionError(
+            "Analysens rowcount må ikke være negativ. "
+            f"Rowcount: {rowcount}."
+        )
+
+    if rowcount > BAADPLADS_MAXROWS:
+        raise AssertionError(
+            "Analysens rowcount er større end "
+            "BAADPLADS_MAXROWS. "
+            f"Rowcount: {rowcount}. "
+            f"Maxrows: {BAADPLADS_MAXROWS}."
+        )
+
+    if (
+        rowcount
+        != TIDLIGERE_OBSERVERET_ROWCOUNT
+    ):
+        logger.warning(
+            "Analysens rowcount er ændret. "
+            "Tidligere observeret: %s. "
+            "Aktuelt resultat: %s.",
+            TIDLIGERE_OBSERVERET_ROWCOUNT,
+            rowcount,
+        )
+
+    return rowcount
+
+
+def valider_baadpladser(
+    baadpladser: list[dict[str, Any]],
+    *,
+    forventet_antal: int,
+) -> None:
+    """
+    Validerer de hentede bådpladsrækker.
+
+    Funktionen kontrollerer både datatypen og antallet af rækker.
+    """
+    if not isinstance(
+        baadpladser,
+        list,
+    ):
+        raise TypeError(
+            "hent_baadpladser() skal returnere "
+            "en liste."
+        )
+
+    for index, baadplads in enumerate(
+        baadpladser,
+        start=1,
+    ):
+        if not isinstance(
+            baadplads,
+            dict,
+        ):
+            raise TypeError(
+                "Alle bådpladsrækker skal være "
+                "dictionaries. "
+                f"Række {index} har typen "
+                f"{type(baadplads).__name__}."
+            )
+
+    if len(baadpladser) != forventet_antal:
+        raise AssertionError(
+            "Antallet af hentede bådpladsrækker "
+            "svarer ikke til analysens rowcount. "
+            f"Rowcount: {forventet_antal}. "
+            f"Hentede rækker: {len(baadpladser)}."
+        )
+
+
+# ------------------------------------------------------------
+# Terminaludskrift
+# ------------------------------------------------------------
+
+def udskriv_analyseresultat(
+    analyseresultat: dict[str, Any],
+    *,
+    rowcount: int,
+) -> None:
+    """
+    Udskriver spatialanalyze-resultatet.
+    """
+    print()
+    print("=" * 80)
+    print("RESULTAT FRA DS-BAADPLADS-ANALYSEN")
+    print("=" * 80)
+    print()
+
+    pprint(
+        analyseresultat,
+        width=120,
+        sort_dicts=False,
+    )
+
+    print()
+    print(
+        "Analysens rowcount:",
+        rowcount,
+    )
+    print("=" * 80)
+
+
+def udskriv_baadpladser(
+    baadpladser: list[dict[str, Any]],
+) -> None:
+    """
+    Udskriver et begrænset antal bådpladsrækker.
+    """
+    viste_baadpladser = (
+        baadpladser[
+            :ANTAL_RAEKKER_TIL_VISNING
+        ]
+    )
+
+    print()
+    print("=" * 80)
+    print("BÅDPLADSER HENTET FRA WEBGIS")
+    print("=" * 80)
+
+    if not viste_baadpladser:
+        print()
+        print(
+            "WebGIS returnerede ingen bådpladsrækker."
+        )
+    else:
+        for index, baadplads in enumerate(
+            viste_baadpladser,
+            start=1,
+        ):
+            print()
+            print(
+                f"Bådplads {index}"
+            )
+            print("-" * 80)
+
+            pprint(
+                baadplads,
+                width=120,
+                sort_dicts=False,
+            )
+
+    print()
+    print(
+        "Antal hentede bådpladser:",
+        len(baadpladser),
+    )
+    print(
+        "Antal viste bådpladser:",
+        len(viste_baadpladser),
+    )
+    print("=" * 80)
+
+
+# ------------------------------------------------------------
+# Fuldautomatisk integrationstest
+# ------------------------------------------------------------
+
+async def test_hent_baadpladser_fuldautomatisk() -> None:
+    """
+    Udfører en spatialanalyse for ds-baadplads og henter
+    derefter de konkrete rækker fra samme WebGIS-session.
+
+    Flow:
+        1. Henter WebGIS-login.
+        2. Starter BrowserSession.
+        3. Opretter Session-Id-listeneren.
+        4. Åbner WebGIS.
+        5. Venter på JSESSIONID og Session-Id.
+        6. Starter spatialanalyze for ds-baadplads.
+        7. Henter de gemte rækker med hent_baadpladser().
+        8. Sammenligner rowcount med antal hentede rækker.
+        9. Udskriver resultatet.
+        10. Lukker browseren sikkert.
+    """
+    load_dotenv()
+
+    logger.info(
+        "Testfunktionen er startet."
+    )
+
+    http_credentials = (
+        hent_webgis_http_credentials()
+    )
+
+    session = BrowserSession(
+        headless=HEADLESS,
+        debug=DEBUG,
+        http_credentials=http_credentials,
+    )
+
+    page: Page | None = None
+
+    try:
+        logger.info("=" * 70)
+        logger.info(
+            "STARTER FULDAUTOMATISK "
+            "DS-BAADPLADS-TEST"
+        )
+        logger.info(
+            "Datasource: %s",
+            BAADPLADS_DATASOURCE,
+        )
+        logger.info(
+            "Command: %s",
+            BAADPLADS_COMMAND,
+        )
+        logger.info(
+            "Spatialexpression: %s",
+            BAADPLADS_SPATIAL_EXPRESSION,
+        )
+        logger.info(
+            "Analyseområde: (%s, %s) til (%s, %s)",
+            BAADPLADS_MIN_X_WC,
+            BAADPLADS_MIN_Y_WC,
+            BAADPLADS_MAX_X_WC,
+            BAADPLADS_MAX_Y_WC,
+        )
+        logger.info("=" * 70)
+
+        await session.start()
+
+        page = await session.new_page()
+
+        # Listeneren skal oprettes før navigationen.
+        session_id_future = (
+            opret_session_id_listener(
+                page
+            )
+        )
+
+        await launch_webgis(
+            page
+        )
+
+        _, session_id = await asyncio.gather(
+            vent_paa_jsessionid(
+                page
+            ),
+            vent_paa_session_id(
+                session_id_future
+            ),
+        )
+
+        logger.info(
+            "WebGIS-sessionen er klar."
+        )
+
+        # ----------------------------------------------------
+        # Trin 1: Start spatialanalysen
+        # ----------------------------------------------------
+
+        logger.info(
+            "Starter spatialanalyse for %s.",
+            BAADPLADS_DATASOURCE,
+        )
+
+        analyseresultat = await spatialanalyze(
+            page=page,
+            session_id=session_id,
+            datasource=BAADPLADS_DATASOURCE,
+            min_x_wc=BAADPLADS_MIN_X_WC,
+            min_y_wc=BAADPLADS_MIN_Y_WC,
+            max_x_wc=BAADPLADS_MAX_X_WC,
+            max_y_wc=BAADPLADS_MAX_Y_WC,
+            maxrows=BAADPLADS_MAXROWS,
+            command=BAADPLADS_COMMAND,
+            spatialexpression=(
+                BAADPLADS_SPATIAL_EXPRESSION
+            ),
+            jsontypes=BAADPLADS_JSONTYPES,
+            outputformat=(
+                BAADPLADS_OUTPUTFORMAT
+            ),
+            error_content_type=(
+                BAADPLADS_ERROR_CONTENT_TYPE
+            ),
+            profile=BAADPLADS_PROFILE,
+        )
+
+        analyseret_rowcount = (
+            valider_analyseresultat(
+                analyseresultat
+            )
+        )
+
+        udskriv_analyseresultat(
+            analyseresultat,
+            rowcount=analyseret_rowcount,
+        )
+
+        logger.info(
+            "Spatialanalysen blev gennemført med "
+            "rowcount=%s.",
+            analyseret_rowcount,
+        )
+
+        # ----------------------------------------------------
+        # Trin 2: Hent de konkrete gemte rækker
+        # ----------------------------------------------------
+
+        logger.info(
+            "Henter bådpladsrækker fra samme "
+            "WebGIS-session."
+        )
+
+        baadpladser = await hent_baadpladser(
+            page=page,
+            session_id=session_id,
+        )
+
+        valider_baadpladser(
+            baadpladser,
+            forventet_antal=(
+                analyseret_rowcount
+            ),
+        )
+
+        udskriv_baadpladser(
+            baadpladser
+        )
+
+        logger.info("=" * 70)
+        logger.info(
+            "DS-BAADPLADS-TESTEN ER GENNEMFØRT"
+        )
+        logger.info(
+            "Analysens rowcount: %s",
+            analyseret_rowcount,
+        )
+        logger.info(
+            "Antal hentede rækker: %s",
+            len(baadpladser),
+        )
+        logger.info("=" * 70)
+
+    except Exception:
+        logger.exception(
+            "Den fuldautomatiske "
+            "ds-baadplads-test fejlede."
+        )
+
+        if (
+            page is not None
+            and not page.is_closed()
+        ):
+            try:
+                await session.screenshot(
+                    page,
+                    "FEJL_ds_baadplads",
+                    always=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Fejlscreenshot kunne ikke gemmes."
+                )
+
+        raise
+
+    finally:
+        logger.info(
+            "Lukker WebGIS-side og BrowserSession."
+        )
+
+        if (
+            page is not None
+            and not page.is_closed()
+        ):
+            try:
+                await session.close_page(
+                    page
+                )
+            except Exception:
+                logger.exception(
+                    "WebGIS-siden kunne ikke "
+                    "lukkes korrekt."
+                )
+
+        try:
+            await session.close()
+        except Exception:
+            logger.exception(
+                "BrowserSession kunne ikke "
+                "lukkes korrekt."
+            )
+
+
+# ------------------------------------------------------------
+# Lokal start
+# ------------------------------------------------------------
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s [%(levelname)s] "
+            "%(name)s: %(message)s"
+        ),
+        force=True,
+    )
+
+    logging.getLogger(
+        "httpx"
+    ).setLevel(logging.WARNING)
+
+    logging.getLogger(
+        "httpcore"
+    ).setLevel(logging.WARNING)
+
+    logging.getLogger(
+        "automation_server_client"
+    ).setLevel(logging.WARNING)
+
+    logging.getLogger(
+        "debugpy"
+    ).setLevel(logging.WARNING)
+
+    logger.info(
+        "Starter test_hent_baadpladser.py."
+    )
+
+    asyncio.run(
+        test_hent_baadpladser_fuldautomatisk()
+    )
+===== ./q_webgis/tests_local/test_konfliktrapport_item_dry_run.py =====
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+from typing import Any
+
+from automation_server_client import AutomationServer, Credential
+from dotenv import load_dotenv
+from playwright.async_api import Page
+
+from q_haderslev_vbo.automation_server.ats_find_items_by_box import (
+    get_workitems_by_box_value,
+)
+from q_haderslev_vbo.playwright.browser_session import BrowserSession
+from q_webgis.configuration import WEBGIS_CREDENTIAL_NAME, WEBGIS_URL
+from q_webgis.functionality.rapport import opret_webgis_rapport
+
+
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------
+# Testopsætning
+# ------------------------------------------------------------
+
+ITEM_REFERENCE = "20261269"
+HEADLESS = False
+DEBUG = True
+
+WEBGIS_TIMEOUT_MS = 60_000
+
+# Samlet rapport-timeout: 30 minutter.
+# q-webgis fordeler timeouten 60/40:
+# - første venteperiode: 18 minutter
+# - anden venteperiode: 12 minutter
+WEBGIS_RAPPORT_TIMEOUT_MS = 40 * 60 * 1_000
+
+RAPPORTMAPPE = Path("tests_local_output")
+FILNAVN = f"konfliktrapport_{ITEM_REFERENCE}_dry_run.pdf"
+
+
+async def test_konfliktrapport_item_dry_run() -> None:
+    """
+    Henter itemet læsende fra konfliktrapport-køen og udfører kun
+    WebGIS-rapportflowet med en synlig browser.
+
+    Testen ændrer ikke itemets data eller status og åbner ikke Acadre.
+
+    Output:
+        Gemmer PDF'en i tests_local_output.
+    """
+    load_dotenv()
+
+    ats = AutomationServer.from_environment()
+    workqueue = ats.workqueue()
+    queue_id = _hent_queue_id(workqueue)
+
+    item_data = _hent_item_data_fra_ats(
+        queue_id=queue_id,
+        item_reference=ITEM_REFERENCE,
+    )
+
+    webgis_data = _hent_webgis_data(item_data)
+    wkt = _paakraevet_tekst(
+        webgis_data.get("shape_wkt"),
+        "box.webgis.shape_wkt",
+    )
+    buildingregulation = _paakraevet_tekst(
+        webgis_data.get("buildingregulation"),
+        "box.webgis.buildingregulation",
+    )
+    tema = _vaelg_webgis_tema(buildingregulation)
+
+    logger.info(
+        "Dry run starter for item reference=%s, queue_id=%s, "
+        "tema=%s, buildingregulation=%r.",
+        ITEM_REFERENCE,
+        queue_id,
+        tema,
+        buildingregulation,
+    )
+    logger.info(
+        "Rapport-timeout: %s ms, svarende til 30 minutter.",
+        WEBGIS_RAPPORT_TIMEOUT_MS,
+    )
+    logger.info(
+        "ATS-itemet læses kun. Testen opdaterer ikke køitemet."
+    )
+
+    session = BrowserSession(
+        headless=HEADLESS,
+        debug=DEBUG,
+        video=False,
+        http_credentials=_hent_webgis_http_credentials(),
+    )
+    page: Page | None = None
+
+    try:
+        logger.info("Starter synlig BrowserSession.")
+        await session.start()
+        page = await session.new_page()
+
+        logger.info("Åbner WebGIS.")
+        response = await page.goto(
+            WEBGIS_URL,
+            wait_until="domcontentloaded",
+            timeout=WEBGIS_TIMEOUT_MS,
+        )
+
+        if response is None:
+            raise RuntimeError(
+                "Navigationen til WebGIS returnerede ikke et HTTP-svar."
+            )
+
+        if not response.ok:
+            raise RuntimeError(
+                "WebGIS returnerede HTTP-status "
+                f"{response.status}."
+            )
+
+        rapportsti = await opret_webgis_rapport(
+            page=page,
+            session=session,
+            wkt=wkt,
+            tema=tema,
+            rapportmappe=RAPPORTMAPPE,
+            filnavn=FILNAVN,
+            vaelg_jordstykker_byggesag=True,
+            timeout_ms=WEBGIS_TIMEOUT_MS,
+            rapport_timeout_ms=WEBGIS_RAPPORT_TIMEOUT_MS,
+        )
+
+        _valider_pdf(rapportsti)
+
+        await session.screenshot(
+            page,
+            f"DRY_RUN_{ITEM_REFERENCE}_FAERDIG",
+            always=True,
+        )
+
+        logger.info(
+            "Dry run lykkedes. Rapport: %s",
+            rapportsti.resolve(),
+        )
+        logger.info(
+            "Item %s blev ikke ændret i Automation Server.",
+            ITEM_REFERENCE,
+        )
+
+        await asyncio.to_thread(
+            input,
+            "\nRapporten er downloadet. "
+            "Tryk Enter for at lukke browseren...",
+        )
+
+    except Exception:
+        logger.exception(
+            "Dry run fejlede for item reference=%s.",
+            ITEM_REFERENCE,
+        )
+
+        if page is not None and not page.is_closed():
+            try:
+                await session.screenshot(
+                    page,
+                    f"DRY_RUN_{ITEM_REFERENCE}_FEJL",
+                    always=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Fejlscreenshot kunne ikke gemmes."
+                )
+
+            await asyncio.to_thread(
+                input,
+                "\nDry run fejlede. Kontrollér browseren og loggen. "
+                "Tryk Enter for at lukke browseren...",
+            )
+
+        raise
+
+    finally:
+        logger.info("Lukker WebGIS og BrowserSession.")
+
+        if page is not None and not page.is_closed():
+            try:
+                await session.close_page(page)
+            except Exception:
+                logger.exception(
+                    "WebGIS-siden kunne ikke lukkes."
+                )
+
+        await session.close()
+
+
+def _hent_queue_id(workqueue: Any) -> int:
+    """Returnerer det validerede tekniske queue-id."""
+    queue_id = getattr(workqueue, "id", None)
+
+    if queue_id is None or isinstance(queue_id, bool):
+        raise ValueError(
+            "Automation Server-workqueuen mangler et gyldigt id."
+        )
+
+    try:
+        validated_queue_id = int(queue_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "workqueue.id skal være et heltal."
+        ) from exc
+
+    if validated_queue_id <= 0:
+        raise ValueError(
+            "workqueue.id skal være større end 0."
+        )
+
+    return validated_queue_id
+
+
+def _hent_item_data_fra_ats(
+    *,
+    queue_id: int,
+    item_reference: str,
+) -> dict[str, Any]:
+    """Henter itemets data læsende via box.caseid."""
+    result = get_workitems_by_box_value(
+        queue_id=queue_id,
+        box_path="caseid",
+        value=item_reference,
+        statuses=None,
+        limit=10,
+    )
+    items = result.get("items")
+
+    if not isinstance(items, list):
+        raise RuntimeError(
+            "ATS-opslaget returnerede ikke items som en liste."
+        )
+
+    matches = [
+        row
+        for row in items
+        if isinstance(row, dict)
+        and str(row.get("reference") or "").strip()
+        == item_reference
+    ]
+
+    if not matches:
+        raise RuntimeError(
+            "Ingen konfliktrapport-items blev fundet med reference "
+            f"{item_reference!r} i queue {queue_id}."
+        )
+
+    if len(matches) > 1:
+        item_ids = [row.get("id") for row in matches]
+        raise RuntimeError(
+            "Der blev fundet flere items med samme reference. "
+            f"Item-id'er: {item_ids}."
+        )
+
+    database_row = matches[0]
+    data = database_row.get("data")
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "Det fundne items data er ikke en dictionary."
+        )
+
+    logger.info(
+        "ATS-item fundet læsende: id=%s, reference=%s, status=%s.",
+        database_row.get("id"),
+        database_row.get("reference"),
+        database_row.get("status"),
+    )
+
+    return data
+
+
+def _hent_webgis_data(
+    item_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Returnerer item.data['box']['webgis']."""
+    box = item_data.get("box")
+
+    if not isinstance(box, dict):
+        raise RuntimeError(
+            "Itemet mangler data['box']."
+        )
+
+    webgis_data = box.get("webgis")
+
+    if not isinstance(webgis_data, dict):
+        raise RuntimeError(
+            "Itemet mangler data['box']['webgis']."
+        )
+
+    return webgis_data
+
+
+def _hent_webgis_http_credentials() -> dict[str, str]:
+    """Henter WebGIS HTTP-login fra Automation Server."""
+    credential = Credential.get_credential(
+        WEBGIS_CREDENTIAL_NAME
+    )
+
+    if credential is None:
+        raise RuntimeError(
+            f"Credentialen {WEBGIS_CREDENTIAL_NAME!r} "
+            "blev ikke fundet."
+        )
+
+    username = str(credential.username or "").strip()
+    password = str(credential.password or "")
+
+    if not username or not password:
+        raise RuntimeError(
+            f"Credentialen {WEBGIS_CREDENTIAL_NAME!r} "
+            "mangler username eller password."
+        )
+
+    return {
+        "username": username,
+        "password": password,
+    }
+
+
+def _vaelg_webgis_tema(
+    buildingregulation: str,
+) -> str:
+    """Vælger samme WebGIS-tema som konfliktrapport-processen."""
+    normaliseret = " ".join(
+        buildingregulation.split()
+    ).casefold()
+
+    if "landzonesag" in normaliseret:
+        return "landzonesager"
+
+    return "byggesag"
+
+
+def _paakraevet_tekst(
+    value: Any,
+    field_name: str,
+) -> str:
+    """Returnerer en obligatorisk, trimmet tekstværdi."""
+    text = str(value or "").strip()
+
+    if not text:
+        raise ValueError(
+            f"{field_name} mangler eller er tom."
+        )
+
+    return text
+
+
+def _valider_pdf(rapportsti: Path) -> None:
+    """Kontrollerer eksistens, størrelse og PDF-signatur."""
+    if not rapportsti.is_file():
+        raise AssertionError(
+            "PDF-rapporten blev ikke fundet: "
+            f"{rapportsti}"
+        )
+
+    if rapportsti.stat().st_size == 0:
+        raise AssertionError(
+            "PDF-rapporten er tom."
+        )
+
+    with rapportsti.open("rb") as pdf_file:
+        if pdf_file.read(5) != b"%PDF-":
+            raise AssertionError(
+                "Rapportfilen har ikke en gyldig PDF-signatur."
+            )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s [%(levelname)s] "
+            "%(name)s: %(message)s"
+        ),
+        force=True,
+    )
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger(
+        "automation_server_client"
+    ).setLevel(logging.WARNING)
+
+    asyncio.run(
+        test_konfliktrapport_item_dry_run()
+    )
+
 ===== ./q_webgis/tests_local/test_launch_webgis.py =====
 import asyncio
 import logging
@@ -2836,6 +6208,9 @@ from q_webgis.functionality.rapport import (
     opret_webgis_rapport,
 )
 
+#
+#VIRKER KUN MED HEADLESS=TRUE
+#
 
 logger = logging.getLogger(__name__)
 
@@ -2923,7 +6298,7 @@ async def test_webgis_rapport() -> None:
     )
 
     session = BrowserSession(
-        headless=False,
+        headless=True,
         debug=True,
         http_credentials=http_credentials,
     )
@@ -3114,7 +6489,7 @@ SESSION_TIMEOUT_SECONDS = 60
 # Browserindstillinger
 # ------------------------------------------------------------
 
-HEADLESS = True
+HEADLESS = False
 DEBUG = True
 
 

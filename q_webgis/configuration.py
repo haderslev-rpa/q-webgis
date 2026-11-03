@@ -23,7 +23,19 @@ WEBGIS_STORED_DATA_URL = (
     "spatialmap?page=spatialanalyze-get-stored-data"
 )
 
-WEBGIS_STORED_DATA_PAGE = "spatialanalyze-get-stored-data"
+WEBGIS_STORED_DATA_PAGE = (
+    "spatialanalyze-get-stored-data"
+)
+
+
+# ------------------------------------------------------------
+# Bådpladsredigering
+# ------------------------------------------------------------
+
+WEBGIS_BAADPLADS_UPDATE_URL = (
+    "https://webgis.intern.udcit.dk/"
+    "sfs/rest/features/ds-baadplads/sps"
+)
 
 
 # ------------------------------------------------------------

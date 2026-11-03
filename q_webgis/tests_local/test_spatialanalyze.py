@@ -36,7 +36,7 @@ SESSION_TIMEOUT_SECONDS = 60
 # Browserindstillinger
 # ------------------------------------------------------------
 
-HEADLESS = True
+HEADLESS = False
 DEBUG = True
 
 
