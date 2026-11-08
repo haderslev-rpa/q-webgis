@@ -18,6 +18,8 @@ from q_haderslev_vbo.playwright.browser_session import (
 )
 
 from q_webgis.configuration import (
+    WEBGIS_PDF_POLL_INTERVAL_MS,
+    WEBGIS_PDF_REQUEST_TIMEOUT_MS,
     WEBGIS_RAPPORT_FILNAVN,
     WEBGIS_RAPPORT_MAPPE,
     WEBGIS_RAPPORT_TIMEOUT_MS,
@@ -26,6 +28,7 @@ from q_webgis.configuration import (
     WEBGIS_TILLADTE_TEMAER,
     WEBGIS_TIMEOUT_MS,
 )
+
 from q_webgis.selectors import (
     GLOBALT_SOEGEFELT,
     HVAD_GAELDER_FOR_KNAP,
@@ -626,10 +629,6 @@ async def _vent_paa_konfliktsoegning_faerdig(
 # Rapport
 # ------------------------------------------------------------
 
-# ------------------------------------------------------------
-# START: aabn_rapport
-# ------------------------------------------------------------
-
 async def aabn_rapport(
     page: Page,
     *,
@@ -638,43 +637,41 @@ async def aabn_rapport(
     """
     Bestiller WebGIS-rapporten og venter på et PDF-resultat.
 
-    Funktionen bevarer det eksisterende download-flow og tilføjer
-    to målrettede sikkerhedsnet:
+    Funktionen understøtter tre mulige rapportforløb:
 
-    1. Et PDF-response accepteres, hvis Chromium ikke udløser et
-       normalt download-event.
-    2. Rapportbestillingen forsøges én ekstra gang, hvis første klik
-       ikke giver et download eller PDF-response.
+    1. Chromium udløser et normalt download-event.
+    2. WebGIS returnerer PDF-bytes direkte i et browserresponse.
+    3. WebGIS returnerer først en midlertidig PDF-URL, hvor filen
+       endnu ikke har en gyldig PDF-signatur. I dette tilfælde
+       hentes den samme URL igen gennem BrowserContextens
+       autentificerede request-klient, indtil PDF'en er klar.
 
-    Den samlede ventetid overstiger ikke timeout_ms.
+    Der klikkes kun én gang på "Vis rapport". Når WebGIS har
+    oprettet en konkret rapport-URL, genereres der ikke en ny
+    rapport.
 
     Output:
         Returnerer den side, som rapportresultatet knyttes til.
-        Resultatet gemmes midlertidigt i _RAPPORT_DOWNLOADS eller
-        _RAPPORT_PDF_BYTES og anvendes af gem_rapport_pdf().
+
+        Et normalt download gemmes midlertidigt i
+        _RAPPORT_DOWNLOADS.
+
+        Direkte eller efterfølgende hentede PDF-bytes gemmes
+        midlertidigt i _RAPPORT_PDF_BYTES.
+
+        gem_rapport_pdf() bruger efterfølgende det registrerede
+        resultat.
     """
     _valider_page(page)
 
-    if (
-        isinstance(timeout_ms, bool)
-        or not isinstance(timeout_ms, int)
-    ):
-        raise TypeError(
-            "timeout_ms skal være et heltal."
-        )
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int):
+        raise TypeError("timeout_ms skal være et heltal.")
 
     if timeout_ms <= 0:
-        raise ValueError(
-            "timeout_ms skal være større end 0."
-        )
+        raise ValueError("timeout_ms skal være større end 0.")
 
-    rapport_knap = page.locator(
-        RAPPORT_KNAP
-    ).filter(
-        has_text=re.compile(
-            r"^\s*Rapport\s*$",
-            re.IGNORECASE,
-        )
+    rapport_knap = page.locator(RAPPORT_KNAP).filter(
+        has_text=re.compile(r"^\s*Rapport\s*$", re.IGNORECASE)
     ).first
 
     await _vent_paa_synlig(
@@ -683,23 +680,12 @@ async def aabn_rapport(
         timeout_ms=timeout_ms,
     )
 
-    logger.info(
-        "Åbner WebGIS-rapportdialogen."
-    )
-
+    logger.info("Åbner WebGIS-rapportdialogen.")
     await rapport_knap.click()
+    await _vent_mellem_selector_actions(page)
 
-    await _vent_mellem_selector_actions(
-        page
-    )
-
-    vis_rapport_knap = page.locator(
-        VIS_RAPPORT_KNAP
-    ).filter(
-        has_text=re.compile(
-            r"^\s*Vis rapport\s*$",
-            re.IGNORECASE,
-        )
+    vis_rapport_knap = page.locator(VIS_RAPPORT_KNAP).filter(
+        has_text=re.compile(r"^\s*Vis rapport\s*$", re.IGNORECASE)
     ).first
 
     await _vent_paa_aktiv(
@@ -708,19 +694,13 @@ async def aabn_rapport(
         timeout_ms=timeout_ms,
     )
 
-    loading = page.locator(
-        RAPPORT_LOADING
-    ).first
-
+    loading = page.locator(RAPPORT_LOADING).first
     event_loop = asyncio.get_running_loop()
+    deadline = event_loop.time() + timeout_ms / 1_000
 
-    download_future: asyncio.Future[Download] = (
-        event_loop.create_future()
-    )
-
-    pdf_response_future: asyncio.Future[bytes] = (
-        event_loop.create_future()
-    )
+    download_future: asyncio.Future[Download] = event_loop.create_future()
+    pdf_response_future: asyncio.Future[bytes] = event_loop.create_future()
+    pdf_url_future: asyncio.Future[str] = event_loop.create_future()
 
     nye_sider: list[Page] = []
     sider_med_download_listener: list[Page] = [page]
@@ -728,22 +708,30 @@ async def aabn_rapport(
     netvaerksfejl: list[str] = []
     mulige_pdf_svar: list[str] = []
 
-    def ved_download(
-        download: Download,
-    ) -> None:
+    def resterende_tid_ms() -> int:
+        """Returnerer den resterende tid frem til den samlede deadline."""
+        resterende_sekunder = deadline - event_loop.time()
+        return max(0, int(resterende_sekunder * 1_000))
+
+    def ved_download(download: Download) -> None:
+        """Registrerer et normalt Playwright-download."""
         if not download_future.done():
             download_future.set_result(download)
 
     async def behandl_response(response) -> None:
+        """
+        Undersøger browserresponses for PDF-data eller en PDF-URL.
+
+        En PDF-URL registreres, selv om body endnu ikke indeholder
+        en gyldig PDF. URL'en kan derefter poll'es separat.
+        """
         try:
             headers = await response.all_headers()
-            content_type = str(
-                headers.get("content-type", "")
-            ).casefold()
+            content_type = str(headers.get("content-type", "")).casefold()
             content_disposition = str(
                 headers.get("content-disposition", "")
             ).casefold()
-            response_url = str(response.url or "")
+            response_url = str(response.url or "").strip()
 
             er_pdf_response = (
                 "application/pdf" in content_type
@@ -755,30 +743,47 @@ async def aabn_rapport(
                     r"\.pdf(?:$|[?#])",
                     response_url,
                     re.IGNORECASE,
-                ) is not None
+                )
+                is not None
             )
 
             if not er_pdf_response:
                 return
 
-            mulige_pdf_svar.append(
-                _sikker_url(response_url)
-            )
+            sikker_response_url = _sikker_url(response_url)
+            mulige_pdf_svar.append(sikker_response_url)
+
+            if response_url and not pdf_url_future.done():
+                pdf_url_future.set_result(response_url)
+                logger.info(
+                    "WebGIS-rapportens PDF-URL er registreret: %s",
+                    sikker_response_url,
+                )
 
             pdf_bytes = await response.body()
 
-            if not pdf_bytes.startswith(b"%PDF-"):
-                logger.warning(
-                    "WebGIS returnerede et muligt PDF-response "
-                    "uden gyldig PDF-signatur. URL=%s, "
-                    "Content-Type=%s.",
-                    _sikker_url(response_url),
-                    content_type,
+            if pdf_bytes.startswith(b"%PDF-"):
+                if not pdf_response_future.done():
+                    pdf_response_future.set_result(pdf_bytes)
+
+                logger.info(
+                    "WebGIS returnerede et gyldigt PDF-response direkte: "
+                    "%s bytes.",
+                    len(pdf_bytes),
                 )
                 return
 
-            if not pdf_response_future.done():
-                pdf_response_future.set_result(pdf_bytes)
+            logger.warning(
+                "WebGIS returnerede et muligt PDF-response uden gyldig "
+                "PDF-signatur. HTTP=%s, Content-Type=%r, antal bytes=%s, "
+                "start=%r, URL=%s. Den samme rapport-URL hentes igen, "
+                "uden at rapporten genbestilles.",
+                response.status,
+                content_type,
+                len(pdf_bytes),
+                pdf_bytes[:100],
+                sikker_response_url,
+            )
 
         except Exception:
             logger.debug(
@@ -787,19 +792,16 @@ async def aabn_rapport(
             )
 
     def ved_response(response) -> None:
-        task = event_loop.create_task(
-            behandl_response(response)
-        )
+        """Starter asynkron behandling af et browserresponse."""
+        task = event_loop.create_task(behandl_response(response))
         response_tasks.add(task)
-        task.add_done_callback(
-            response_tasks.discard
-        )
+        task.add_done_callback(response_tasks.discard)
 
     def ved_request_failed(request) -> None:
+        """Registrerer de seneste netværksfejl til fejlloggen."""
         try:
             netvaerksfejl.append(
-                f"{request.method} "
-                f"{_sikker_url(request.url)} "
+                f"{request.method} {_sikker_url(request.url)} "
                 f"failure={request.failure!r}"
             )
         except Exception:
@@ -808,176 +810,247 @@ async def aabn_rapport(
             )
 
     def ved_ny_side(ny_side: Page) -> None:
+        """
+        Registrerer en eventuel rapportfane.
+
+        WebGIS kan først oprette fanen som about:blank og senere
+        hente rapport-URL'en som et separat netværksresponse.
+        """
         nye_sider.append(ny_side)
         ny_side.on("download", ved_download)
         sider_med_download_listener.append(ny_side)
-
         logger.info(
-            "WebGIS oprettede en rapportfane. "
-            "Aktuel URL: %s",
+            "WebGIS oprettede en rapportfane. Aktuel URL: %s",
             _sikker_url(ny_side.url),
         )
+
+    async def hent_pdf_fra_url(pdf_url: str) -> bytes:
+        """
+        Henter den samme rapport-URL, indtil den indeholder en PDF.
+
+        BrowserContextens request-klient anvendes, så eksisterende
+        cookies, HTTP-credentials og WebGIS-session genbruges.
+
+        Der oprettes ikke en ny rapportbestilling.
+        """
+        valideret_pdf_url = str(pdf_url or "").strip()
+
+        if not valideret_pdf_url:
+            raise RuntimeError("WebGIS returnerede en tom PDF-URL.")
+
+        if re.search(
+            r"\.pdf(?:$|[?#])",
+            valideret_pdf_url,
+            re.IGNORECASE,
+        ) is None:
+            raise RuntimeError(
+                "Den registrerede WebGIS-URL ligner ikke en PDF-adresse. "
+                f"URL={_sikker_url(valideret_pdf_url)}"
+            )
+
+        forsoeg = 0
+        seneste_status: int | None = None
+        seneste_content_type = ""
+        seneste_antal_bytes = 0
+        seneste_start = b""
+
+        while True:
+            tilbage_ms = resterende_tid_ms()
+
+            if tilbage_ms <= 0:
+                raise RuntimeError(
+                    "WebGIS oprettede en PDF-URL, men URL'en leverede ikke "
+                    "en gyldig PDF inden for den samlede timeout. "
+                    f"URL={_sikker_url(valideret_pdf_url)}, "
+                    f"antal henteforsøg={forsoeg}, "
+                    f"seneste HTTP-status={seneste_status}, "
+                    f"seneste Content-Type={seneste_content_type!r}, "
+                    f"seneste antal bytes={seneste_antal_bytes}, "
+                    f"seneste start={seneste_start!r}."
+                )
+
+            forsoeg += 1
+            request_timeout_ms = min(
+                tilbage_ms,
+                WEBGIS_PDF_REQUEST_TIMEOUT_MS,
+            )
+
+            try:
+                response = await page.context.request.get(
+                    valideret_pdf_url,
+                    headers={
+                        "Accept": "application/pdf",
+                        "Cache-Control": "no-cache",
+                    },
+                    timeout=request_timeout_ms,
+                )
+
+                seneste_status = response.status
+                response_headers = response.headers
+                seneste_content_type = str(
+                    response_headers.get("content-type", "")
+                ).casefold()
+                pdf_bytes = await response.body()
+                seneste_antal_bytes = len(pdf_bytes)
+                seneste_start = pdf_bytes[:100]
+
+                if pdf_bytes.startswith(b"%PDF-"):
+                    logger.info(
+                        "WebGIS-PDF blev hentet fra den eksisterende "
+                        "rapport-URL. Forsøg=%s, HTTP=%s, antal bytes=%s, "
+                        "URL=%s.",
+                        forsoeg,
+                        seneste_status,
+                        len(pdf_bytes),
+                        _sikker_url(valideret_pdf_url),
+                    )
+                    return pdf_bytes
+
+                logger.warning(
+                    "WebGIS-rapporten er endnu ikke en gyldig PDF. "
+                    "Forsøg=%s, HTTP=%s, Content-Type=%r, antal bytes=%s, "
+                    "start=%r, URL=%s.",
+                    forsoeg,
+                    seneste_status,
+                    seneste_content_type,
+                    len(pdf_bytes),
+                    pdf_bytes[:100],
+                    _sikker_url(valideret_pdf_url),
+                )
+
+            except PlaywrightTimeoutError:
+                logger.warning(
+                    "Timeout ved hentning af den eksisterende "
+                    "WebGIS-rapport-URL. Forsøg=%s, URL=%s.",
+                    forsoeg,
+                    _sikker_url(valideret_pdf_url),
+                )
+
+            except Exception:
+                logger.warning(
+                    "Den eksisterende WebGIS-rapport-URL kunne ikke hentes. "
+                    "Forsøg=%s, URL=%s.",
+                    forsoeg,
+                    _sikker_url(valideret_pdf_url),
+                    exc_info=True,
+                )
+
+            tilbage_ms = resterende_tid_ms()
+
+            if tilbage_ms <= 0:
+                continue
+
+            poll_interval_ms = min(
+                WEBGIS_PDF_POLL_INTERVAL_MS,
+                tilbage_ms,
+            )
+            logger.info(
+                "Venter %s ms før næste hentning af den samme "
+                "WebGIS-rapport-URL.",
+                poll_interval_ms,
+            )
+            await page.wait_for_timeout(poll_interval_ms)
+
+    async def vent_paa_foerste_resultat() -> tuple[
+        str,
+        Download | bytes | str,
+    ]:
+        """Venter på download, gyldige PDF-bytes eller en PDF-URL."""
+        tilbage_ms = resterende_tid_ms()
+
+        if tilbage_ms <= 0:
+            raise TimeoutError("Den samlede timeout er udløbet.")
+
+        faerdige, _ = await asyncio.wait(
+            {
+                download_future,
+                pdf_response_future,
+                pdf_url_future,
+            },
+            timeout=tilbage_ms / 1_000,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if download_future in faerdige:
+            return "download", download_future.result()
+
+        if pdf_response_future in faerdige:
+            return "pdf_bytes", pdf_response_future.result()
+
+        if pdf_url_future in faerdige:
+            return "pdf_url", pdf_url_future.result()
+
+        raise TimeoutError(
+            "Der kom hverken download-event, PDF-response eller PDF-URL."
+        )
+
+    async def hent_synlig_tekst() -> str:
+        """Returnerer et begrænset tekstudtræk til fejllogning."""
+        try:
+            return " ".join(
+                (await page.locator("body").inner_text()).split()
+            )
+        except Exception:
+            return ""
 
     page.on("download", ved_download)
     page.context.on("page", ved_ny_side)
     page.context.on("response", ved_response)
     page.context.on("requestfailed", ved_request_failed)
 
-    async def vent_paa_rapportresultat(
-        ventetid_ms: int,
-    ) -> tuple[str, Download | bytes]:
-        faerdige, _ = await asyncio.wait(
-            {
-                download_future,
-                pdf_response_future,
-            },
-            timeout=ventetid_ms / 1_000,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if download_future in faerdige:
-            return (
-                "download",
-                download_future.result(),
-            )
-
-        if pdf_response_future in faerdige:
-            return (
-                "pdf_bytes",
-                pdf_response_future.result(),
-            )
-
-        raise TimeoutError(
-            "Der kom hverken download-event eller PDF-response."
-        )
-
-    async def hent_synlig_tekst() -> str:
-        try:
-            return " ".join(
-                (
-                    await page.locator("body").inner_text()
-                ).split()
-            )
-        except Exception:
-            return ""
-
     try:
-        foerste_forsoeg_ms = max(
-            1,
-            int(timeout_ms * 0.60),
-        )
-        andet_forsoeg_ms = max(
-            1,
-            timeout_ms - foerste_forsoeg_ms,
-        )
-
         logger.info(
-            "Bestiller rapporten og venter på download-event "
-            "eller PDF-response. Første forsøg=%s ms, "
-            "genforsøg=%s ms.",
-            foerste_forsoeg_ms,
-            andet_forsoeg_ms,
+            "Bestiller WebGIS-rapporten én gang og venter på download, "
+            "PDF-response eller PDF-URL. Samlet timeout=%s ms.",
+            timeout_ms,
         )
 
         await vis_rapport_knap.click()
 
         try:
-            resultat_type, resultat = (
-                await vent_paa_rapportresultat(
-                    foerste_forsoeg_ms
-                )
-            )
+            resultat_type, resultat = await vent_paa_foerste_resultat()
+        except TimeoutError as error:
+            popup_information = [
+                {
+                    "url": _sikker_url(popup.url),
+                    "lukket": popup.is_closed(),
+                }
+                for popup in nye_sider
+            ]
+            synlig_tekst = await hent_synlig_tekst()
 
-        except TimeoutError:
-            logger.warning(
-                "Første rapportbestilling gav hverken download, "
-                "PDF-response eller rapportfane. Udfører ét "
-                "kontrolleret genforsøg."
-            )
+            raise RuntimeError(
+                "WebGIS leverede hverken download, PDF-response eller "
+                "PDF-URL efter rapportbestillingen. "
+                f"Samlet timeout={timeout_ms} ms. "
+                f"Registrerede rapportfaner={popup_information}. "
+                f"Mulige PDF-responses={mulige_pdf_svar[-10:]}. "
+                f"Seneste netværksfejl={netvaerksfejl[-10:]}. "
+                f"Synlig WebGIS-tekst={synlig_tekst[:2_000]!r}."
+            ) from error
 
-            if not await vis_rapport_knap.is_visible():
-                await _vent_paa_synlig(
-                    rapport_knap,
-                    navn="Rapport-knappen ved genforsøg",
-                    timeout_ms=andet_forsoeg_ms,
-                )
+        if resultat_type == "pdf_url":
+            pdf_url = resultat
 
-                await rapport_knap.click()
-
-                await _vent_mellem_selector_actions(
-                    page
-                )
-
-                vis_rapport_knap = page.locator(
-                    VIS_RAPPORT_KNAP
-                ).filter(
-                    has_text=re.compile(
-                        r"^\s*Vis rapport\s*$",
-                        re.IGNORECASE,
-                    )
-                ).first
-
-            overlay_arbejder = (
-                await loading.count() > 0
-                and await loading.is_visible()
-            )
-
-            if overlay_arbejder:
-                logger.warning(
-                    "WebGIS viser stadig 'Arbejder...'. "
-                    "Den oprindelige rapportbestilling kører "
-                    "derfor fortsat. Klikker ikke Vis rapport "
-                    "igen, men venter videre på download eller "
-                    "PDF-response."
-                )
-
-            else:
-                await _vent_paa_aktiv(
-                    vis_rapport_knap,
-                    navn="Vis rapport-knappen ved genforsøg",
-                    timeout_ms=andet_forsoeg_ms,
-                )
-
-                logger.info(
-                    "WebGIS arbejder ikke længere. "
-                    "Klikker Vis rapport igen."
-                )
-
-                await vis_rapport_knap.click(
-                    timeout=andet_forsoeg_ms,
-                )
-
-            try:
-                resultat_type, resultat = (
-                    await vent_paa_rapportresultat(
-                        andet_forsoeg_ms
-                    )
-                )
-
-            except TimeoutError as error:
-                popup_information = [
-                    {
-                        "url": _sikker_url(popup.url),
-                        "lukket": popup.is_closed(),
-                    }
-                    for popup in nye_sider
-                ]
-
-                synlig_tekst = await hent_synlig_tekst()
-
+            if not isinstance(pdf_url, str):
                 raise RuntimeError(
-                    "WebGIS leverede ikke en PDF efter to "
-                    "rapportbestillinger. "
-                    f"Samlet timeout={timeout_ms} ms. "
-                    f"Registrerede rapportfaner="
-                    f"{popup_information}. "
-                    f"Mulige PDF-responses="
-                    f"{mulige_pdf_svar[-10:]}. "
-                    f"Seneste netværksfejl="
-                    f"{netvaerksfejl[-10:]}. "
-                    f"Synlig WebGIS-tekst="
-                    f"{synlig_tekst[:2_000]!r}."
-                ) from error
+                    "Den registrerede PDF-URL havde en uventet datatype."
+                )
+
+            if pdf_response_future.done():
+                resultat_type = "pdf_bytes"
+                resultat = pdf_response_future.result()
+            elif download_future.done():
+                resultat_type = "download"
+                resultat = download_future.result()
+            else:
+                logger.info(
+                    "WebGIS har oprettet rapport-URL'en %s. Den samme URL "
+                    "hentes nu igen, indtil den indeholder en gyldig PDF.",
+                    _sikker_url(pdf_url),
+                )
+                resultat_type = "pdf_bytes"
+                resultat = await hent_pdf_fra_url(pdf_url)
 
         rapport_side = page
 
@@ -991,22 +1064,17 @@ async def aabn_rapport(
 
             if not isinstance(download, Download):
                 raise RuntimeError(
-                    "Det registrerede downloadresultat "
-                    "havde en uventet type."
+                    "Det registrerede downloadresultat havde en uventet type."
                 )
 
             download_fejl = await download.failure()
 
             if download_fejl:
                 raise RuntimeError(
-                    "WebGIS-downloadet fejlede: "
-                    f"{download_fejl}"
+                    f"WebGIS-downloadet fejlede: {download_fejl}"
                 )
 
-            _RAPPORT_DOWNLOADS[
-                id(rapport_side)
-            ] = download
-
+            _RAPPORT_DOWNLOADS[id(rapport_side)] = download
             logger.info(
                 "Download-event modtaget. Foreslået filnavn: %s. "
                 "Rapportfane oprettet: %s.",
@@ -1024,17 +1092,13 @@ async def aabn_rapport(
 
             if not pdf_bytes.startswith(b"%PDF-"):
                 raise RuntimeError(
-                    "WebGIS-response mangler en gyldig "
-                    "PDF-signatur."
+                    "WebGIS-response mangler en gyldig PDF-signatur."
                 )
 
-            _RAPPORT_PDF_BYTES[
-                id(rapport_side)
-            ] = pdf_bytes
-
+            _RAPPORT_PDF_BYTES[id(rapport_side)] = pdf_bytes
             logger.info(
-                "PDF-response modtaget direkte fra WebGIS: "
-                "%s bytes. Rapportfane oprettet: %s.",
+                "Gyldige PDF-bytes modtaget fra WebGIS: %s bytes. "
+                "Rapportfane oprettet: %s.",
                 len(pdf_bytes),
                 rapport_side is not page,
             )
@@ -1049,7 +1113,7 @@ async def aabn_rapport(
             try:
                 await loading.wait_for(
                     state="hidden",
-                    timeout=min(timeout_ms, 60_000),
+                    timeout=min(resterende_tid_ms(), 60_000),
                 )
             except PlaywrightTimeoutError:
                 logger.debug(
@@ -1060,29 +1124,17 @@ async def aabn_rapport(
         return rapport_side
 
     finally:
-        page.context.remove_listener(
-            "page",
-            ved_ny_side,
-        )
-        page.context.remove_listener(
-            "response",
-            ved_response,
-        )
-        page.context.remove_listener(
-            "requestfailed",
-            ved_request_failed,
-        )
+        page.context.remove_listener("page", ved_ny_side)
+        page.context.remove_listener("response", ved_response)
+        page.context.remove_listener("requestfailed", ved_request_failed)
 
         for listener_side in sider_med_download_listener:
             try:
-                listener_side.remove_listener(
-                    "download",
-                    ved_download,
-                )
+                listener_side.remove_listener("download", ved_download)
             except Exception:
                 logger.debug(
-                    "Download-listeneren kunne ikke fjernes "
-                    "fra en WebGIS-side.",
+                    "Download-listeneren kunne ikke fjernes fra en "
+                    "WebGIS-side.",
                     exc_info=True,
                 )
 
@@ -1091,10 +1143,6 @@ async def aabn_rapport(
                 *response_tasks,
                 return_exceptions=True,
             )
-
-# ------------------------------------------------------------
-# SLUT: aabn_rapport
-# ------------------------------------------------------------
 
 # ------------------------------------------------------------
 # START: gem_rapport_pdf

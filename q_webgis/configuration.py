@@ -11,6 +11,7 @@ WEBGIS_URL = (
 )
 
 WEBGIS_CREDENTIAL_NAME = "DIRXOAS"
+
 WEBGIS_PROFILE = "maxi"
 
 
@@ -54,12 +55,45 @@ WEBGIS_MAXROWS = 20_000
 # ------------------------------------------------------------
 
 # Standard-timeout for almindelige WebGIS-handlinger.
+#
+# 60.000 millisekunder svarer til 60 sekunder.
 WEBGIS_TIMEOUT_MS = 60_000
 
-# Udvidet timeout til konfliktsøgning og rapportgenerering.
-WEBGIS_RAPPORT_TIMEOUT_MS = 180_000
+
+# Samlet timeout for konfliktsøgning og rapportgenerering.
+#
+# Timeouten omfatter:
+# - ventetid på rapportdialogen
+# - WebGIS' generering af rapporten
+# - registrering af download eller PDF-URL
+# - efterfølgende polling af den samme PDF-URL
+#
+# 30 minutter giver plads til tunge konfliktrapporter uden at
+# blokere robotten i flere timer.
+WEBGIS_RAPPORT_TIMEOUT_MS = 30 * 60 * 1_000
+
+
+# Maksimal timeout for ét HTTP-kald mod en kendt PDF-URL.
+#
+# Denne værdi anvendes, når WebGIS har oprettet en adresse som:
+# /tmp/report123456789.pdf
+#
+# Ét request må højst vente 60 sekunder. Hvis svaret endnu ikke
+# er en gyldig PDF, foretages et nyt forsøg efter poll-intervallet.
+WEBGIS_PDF_REQUEST_TIMEOUT_MS = 60_000
+
+
+# Ventetid mellem gentagne hentninger af den samme PDF-URL.
+#
+# Rapporten genbestilles ikke. Robotten forsøger blot at hente
+# den allerede oprettede rapport igen.
+#
+# 5.000 millisekunder svarer til 5 sekunder.
+WEBGIS_PDF_POLL_INTERVAL_MS = 5_000
+
 
 # Fast pause mellem Playwright-selectorhandlinger.
+#
 # 1.000 millisekunder svarer til ét sekund.
 WEBGIS_SELECTOR_ACTION_WAIT_MS = 1_000
 
